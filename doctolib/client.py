@@ -80,10 +80,7 @@ class DoctolibClient:
         """
         # Step 1: Initialize session (get cookies, CSRF token)
         try:
-            resp = self.session.get(
-                self._url("/sessions/new"),
-                headers=self.NAV_HEADERS,
-            )
+            resp = self.session.get(self._url("/sessions/new"))
             if resp.status_code in (503, 520):
                 return {
                     "success": False,
@@ -107,11 +104,7 @@ class DoctolibClient:
         }
 
         try:
-            resp = self.session.post(
-                self._url("/login.json"),
-                json=login_payload,
-                headers=self.API_HEADERS,
-            )
+            resp = self.session.post(self._url("/login.json"), json=login_payload)
         except Exception as e:
             return {
                 "success": False,
@@ -157,7 +150,6 @@ class DoctolibClient:
                 self.session.post(
                     self._url("/api/accounts/send_auth_code"),
                     json={"two_factor_auth_method": "email"},
-                    headers=self.API_HEADERS,
                 )
             except Exception:
                 pass  # Code may already be sent
@@ -185,50 +177,29 @@ class DoctolibClient:
                 return
 
     def submit_2fa_code(self, code: str) -> dict[str, Any]:
-        """Submit 2FA authentication code."""
-        strategies = []
+        """Submit 2FA authentication code.
 
-        # Get the two_factor_auth_response if it was in the login data
-        tfa_challenge = self._account_data.get("two_factor_auth_response")
-
-        # IMPORTANT: Try dedicated 2FA endpoints FIRST to preserve the session.
-        # The combined login+2FA replaces session cookies and may invalidate the
-        # 2FA state, so it must be tried LAST as a fallback.
-
-        # Strategy 1: Dedicated 2FA endpoint (preserves session)
-        tfa_payload: dict[str, Any] = {"auth_code": code}
-        if tfa_challenge:
-            tfa_payload["two_factor_auth_response"] = tfa_challenge
-        strategies.append(("/api/accounts/two_factor_authentication", tfa_payload))
-
-        # Strategy 2: Dedicated 2FA with email method specified
-        strategies.append(("/api/accounts/two_factor_authentication", {
-            "auth_code": code,
-            "two_factor_auth_method": "email",
-        }))
-
-        # Strategy 3 (LAST): Combined login + 2FA (replaces session!)
-        combined_payload = {
-            "kind": "doctor",
-            "username": self.email,
-            "password": self.password,
-            "auth_code": code,
-            "two_factor_auth_method": "email",
-            "remember": True,
-            "remember_username": True,
-        }
-        if tfa_challenge:
-            combined_payload["two_factor_auth_response"] = tfa_challenge
-        strategies.append(("/login.json", combined_payload))
+        IMPORTANT: Uses session default headers (no API_HEADERS) for 2FA POSTs.
+        Adding X-Requested-With or sec-fetch-mode: cors breaks the 2FA endpoint.
+        """
+        # Strategy 1: Dedicated 2FA endpoint (preserves existing session)
+        # Strategy 2: Combined login + 2FA (as fallback only - replaces session)
+        strategies = [
+            ("/api/accounts/two_factor_authentication", {"auth_code": code}),
+            ("/login.json", {
+                "kind": "doctor",
+                "username": self.email,
+                "password": self.password,
+                "auth_code": code,
+                "two_factor_auth_method": "email",
+            }),
+        ]
 
         all_attempts = []
         for endpoint, payload in strategies:
             try:
-                resp = self.session.post(
-                    self._url(endpoint),
-                    json=payload,
-                    headers=self.API_HEADERS,
-                )
+                # NO API_HEADERS here - use session defaults only
+                resp = self.session.post(self._url(endpoint), json=payload)
                 logger.info(f"2FA [{endpoint}]: HTTP {resp.status_code}")
 
                 resp_data = None
@@ -236,55 +207,36 @@ class DoctolibClient:
                     resp_data = resp.json()
                     logger.info(f"2FA [{endpoint}] response: {resp_data}")
                 except ValueError:
-                    logger.info(f"2FA [{endpoint}] non-JSON: {resp.text[:200]}")
+                    pass
 
-                attempt = {
+                all_attempts.append({
                     "endpoint": endpoint,
                     "status": resp.status_code,
                     "data": resp_data,
-                }
-                all_attempts.append(attempt)
-
-                # Store last attempt for debug
-                self._tfa_response = {
-                    "attempts": all_attempts,
-                    "cookies": list(self.session.cookies.keys()),
-                }
+                })
 
                 if resp.status_code < 400:
+                    # Store any account data from response
                     if isinstance(resp_data, dict):
                         self._extract_token(resp_data)
                         if any(k in resp_data for k in ("doctor", "agendas", "id")):
                             self._account_data = resp_data
 
-                        # Only check redirect for the combined login endpoint
-                        # The dedicated 2FA endpoint validates the code, period.
-                        if endpoint == "/login.json":
-                            redir = resp_data.get("redirect") or resp_data.get("redirection")
-                            if redir and "two-factor" in str(redir):
-                                logger.warning(f"Combined login still needs 2FA: {redir}")
-                                continue
-
                     self._authenticated = True
                     self._requires_2fa = False
+                    self._tfa_response = {"attempts": all_attempts}
                     return {
                         "success": True,
                         "requires_2fa": False,
-                        "message": f"Authentification 2FA réussie via {endpoint}.",
+                        "message": f"2FA réussie via {endpoint}.",
+                        "debug": all_attempts,
                     }
-                else:
-                    logger.warning(f"2FA [{endpoint}]: HTTP {resp.status_code}")
             except Exception as e:
                 all_attempts.append({"endpoint": endpoint, "error": str(e)})
                 logger.warning(f"2FA [{endpoint}] failed: {e}")
                 continue
 
-        # Store debug info even on failure
-        self._tfa_response = {
-            "attempts": all_attempts,
-            "cookies": list(self.session.cookies.keys()),
-        }
-
+        self._tfa_response = {"attempts": all_attempts}
         return {
             "success": False,
             "requires_2fa": True,

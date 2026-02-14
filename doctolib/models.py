@@ -19,6 +19,7 @@ class LoginResponse(BaseModel):
     success: bool
     requires_2fa: bool = False
     message: str = ""
+    debug: Optional[Any] = None
 
 
 class AuthStatus(BaseModel):
