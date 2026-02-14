@@ -191,7 +191,23 @@ class DoctolibClient:
         # Get the two_factor_auth_response if it was in the login data
         tfa_challenge = self._account_data.get("two_factor_auth_response")
 
-        # Strategy 1: Combined login + 2FA code (full login in one shot)
+        # IMPORTANT: Try dedicated 2FA endpoints FIRST to preserve the session.
+        # The combined login+2FA replaces session cookies and may invalidate the
+        # 2FA state, so it must be tried LAST as a fallback.
+
+        # Strategy 1: Dedicated 2FA endpoint (preserves session)
+        tfa_payload: dict[str, Any] = {"auth_code": code}
+        if tfa_challenge:
+            tfa_payload["two_factor_auth_response"] = tfa_challenge
+        strategies.append(("/api/accounts/two_factor_authentication", tfa_payload))
+
+        # Strategy 2: Dedicated 2FA with email method specified
+        strategies.append(("/api/accounts/two_factor_authentication", {
+            "auth_code": code,
+            "two_factor_auth_method": "email",
+        }))
+
+        # Strategy 3 (LAST): Combined login + 2FA (replaces session!)
         combined_payload = {
             "kind": "doctor",
             "username": self.email,
@@ -204,18 +220,6 @@ class DoctolibClient:
         if tfa_challenge:
             combined_payload["two_factor_auth_response"] = tfa_challenge
         strategies.append(("/login.json", combined_payload))
-
-        # Strategy 2: Dedicated 2FA endpoint
-        tfa_payload = {"auth_code": code}
-        if tfa_challenge:
-            tfa_payload["two_factor_auth_response"] = tfa_challenge
-        strategies.append(("/api/accounts/two_factor_authentication", tfa_payload))
-
-        # Strategy 3: Dedicated 2FA with email method specified
-        strategies.append(("/api/accounts/two_factor_authentication", {
-            "auth_code": code,
-            "two_factor_auth_method": "email",
-        }))
 
         for endpoint, payload in strategies:
             try:
