@@ -200,6 +200,65 @@ class DoctolibClient:
             self._csrf_token = match.group(1)
             logger.info(f"CSRF token extracted ({len(self._csrf_token)} chars)")
 
+    def _summarize_dict(self, d: dict, max_depth: int = 2) -> dict[str, Any]:
+        """Create a summary of a dict showing types and sizes."""
+        summary = {}
+        for k, v in list(d.items())[:30]:
+            if v is None:
+                summary[k] = None
+            elif isinstance(v, str):
+                summary[k] = f"str({len(v)})" if len(v) > 50 else v
+            elif isinstance(v, bool):
+                summary[k] = v
+            elif isinstance(v, (int, float)):
+                summary[k] = v
+            elif isinstance(v, list):
+                summary[k] = f"list({len(v)})"
+                if v and max_depth > 0 and isinstance(v[0], dict):
+                    summary[k + "[0]_keys"] = list(v[0].keys())[:10]
+            elif isinstance(v, dict):
+                summary[k] = f"dict({len(v)} keys)"
+                if max_depth > 0:
+                    summary[k + "_keys"] = list(v.keys())[:10]
+        return summary
+
+    def _process_embedded_data(self, embedded: dict, debug: dict) -> None:
+        """Process embedded data from HTML to extract account info."""
+        # Check all embedded data sources
+        all_keys = [
+            "initial_state", "window_data", "current_user",
+            "data_props", "data_props_sq", "react_props",
+        ]
+        for key in all_keys:
+            if key not in embedded:
+                continue
+            ed = embedded[key]
+            if not isinstance(ed, dict):
+                continue
+
+            # Direct account data (has doctor/agendas at top level)
+            if "doctor" in ed or "agendas" in ed:
+                self._account_data = ed
+                debug["account_from"] = f"embedded.{key}"
+                return
+
+            # Nested structures: check common wrapper patterns
+            # e.g., data_props might have {currentUser: {doctor: ...}}
+            for nested_key in ("currentUser", "current_user", "user", "account",
+                               "data", "props", "state", "session"):
+                nested = ed.get(nested_key)
+                if isinstance(nested, dict):
+                    if "doctor" in nested or "agendas" in nested:
+                        self._account_data = nested
+                        debug["account_from"] = f"embedded.{key}.{nested_key}"
+                        return
+
+            # If data_props has any useful structure, store it as account data
+            # even without doctor/agendas keys (we'll need to explore the structure)
+            if key == "data_props" and len(ed) > 0:
+                self._account_data = ed
+                debug["account_from"] = f"embedded.{key} (full)"
+
     def _extract_embedded_data(self, html: str) -> dict[str, Any]:
         """Extract embedded JSON data from HTML page (Rails/React/SPA apps)."""
         data = {}
@@ -323,6 +382,7 @@ class DoctolibClient:
         2. Extract embedded data (account info, agendas)
         3. Get CSRF token
         4. Test if admin.doctolib.fr is accessible
+        5. Navigate to more pages for data extraction
         """
         debug: dict[str, Any] = {"steps": []}
 
@@ -341,17 +401,42 @@ class DoctolibClient:
                 embedded = self._extract_embedded_data(resp.text)
                 if embedded:
                     debug["embedded_keys"] = list(embedded.keys())
-                    for key in ("initial_state", "window_data", "current_user"):
-                        if key in embedded and isinstance(embedded[key], dict):
-                            ed = embedded[key]
-                            if "doctor" in ed or "agendas" in ed:
-                                self._account_data = ed
-                                debug["account_from"] = f"embedded.{key}"
-                                break
+                    # Show data_props content summary
+                    for key, value in embedded.items():
+                        if isinstance(value, dict):
+                            debug[f"embedded_{key}_keys"] = list(value.keys())[:30]
+                            debug[f"embedded_{key}_summary"] = self._summarize_dict(value)
+                        elif isinstance(value, str):
+                            debug[f"embedded_{key}_raw"] = value[:500]
+
+                    # Try to extract account data from any embedded source
+                    self._process_embedded_data(embedded, debug)
         except Exception as e:
             debug["steps"].append({"action": "GET /", "error": str(e)})
 
-        # Step 2: Try to get account data via JSON endpoints
+        # Step 2: Explore more HTML pages for embedded data
+        html_pages = ["/calendar", "/agenda", "/settings", "/account"]
+        for page_path in html_pages:
+            try:
+                resp = self.session.get(self._url(page_path))
+                ct = resp.headers.get("content-type", "")
+                step_info: dict[str, Any] = {
+                    "action": f"GET {page_path}",
+                    "status": resp.status_code,
+                    "content_type": ct,
+                }
+                if resp.status_code == 200 and "text/html" in ct:
+                    embedded = self._extract_embedded_data(resp.text)
+                    if embedded:
+                        step_info["embedded_keys"] = list(embedded.keys())
+                        for key, value in embedded.items():
+                            if isinstance(value, dict):
+                                step_info[f"{key}_keys"] = list(value.keys())[:20]
+                debug["steps"].append(step_info)
+            except Exception as e:
+                debug["steps"].append({"action": f"GET {page_path}", "error": str(e)})
+
+        # Step 3: Try JSON endpoints for account data
         for path in ["/account.json", "/api/account.json", "/api/accounts.json"]:
             try:
                 resp = self._api_get(path)
@@ -373,7 +458,7 @@ class DoctolibClient:
             except Exception as e:
                 debug["steps"].append({"action": f"GET {path}", "error": str(e)})
 
-        # Step 3: Test admin.doctolib.fr accessibility
+        # Step 4: Test admin.doctolib.fr accessibility
         self._admin_base_url = None
         try:
             resp = self.session.get("https://admin.doctolib.fr/")
@@ -424,7 +509,7 @@ class DoctolibClient:
             })
             debug["admin_accessible"] = False
 
-        # Step 4: Record session state
+        # Step 5: Record session state
         debug["cookies"] = {}
         for cookie in self.session.cookies:
             domain = cookie.domain
@@ -576,6 +661,115 @@ class DoctolibClient:
             })
 
         return results
+
+    def debug_dashboard(self) -> dict[str, Any]:
+        """Load dashboard and return full embedded data for inspection."""
+        result: dict[str, Any] = {"pages": {}}
+
+        # Load multiple pages and extract all embedded data
+        pages = ["/", "/calendar", "/agenda", "/settings"]
+        for page_path in pages:
+            page_info: dict[str, Any] = {}
+            try:
+                resp = self.session.get(self._url(page_path))
+                page_info["status"] = resp.status_code
+                page_info["content_type"] = resp.headers.get("content-type", "")
+
+                if resp.status_code == 200 and "text/html" in page_info["content_type"]:
+                    page_info["html_size"] = len(resp.text)
+
+                    # Extract embedded data
+                    embedded = self._extract_embedded_data(resp.text)
+                    if embedded:
+                        page_info["embedded"] = {}
+                        for key, value in embedded.items():
+                            if isinstance(value, dict):
+                                # Show full structure (truncate large values)
+                                page_info["embedded"][key] = self._deep_summarize(value)
+                            elif isinstance(value, str):
+                                page_info["embedded"][key + "_raw"] = value[:1000]
+                            else:
+                                page_info["embedded"][key] = value
+
+                    # Also look for all data- attributes with JSON
+                    data_attrs = re.findall(
+                        r'data-([a-z-]+)="([^"]{20,})"', resp.text
+                    )
+                    if data_attrs:
+                        page_info["data_attributes"] = {}
+                        for attr_name, attr_value in data_attrs[:10]:
+                            decoded = (
+                                attr_value.replace("&quot;", '"')
+                                .replace("&amp;", "&")
+                                .replace("&#39;", "'")
+                            )
+                            try:
+                                parsed = json.loads(decoded)
+                                if isinstance(parsed, dict):
+                                    page_info["data_attributes"][attr_name] = (
+                                        self._deep_summarize(parsed)
+                                    )
+                                else:
+                                    page_info["data_attributes"][attr_name] = parsed
+                            except (json.JSONDecodeError, ValueError):
+                                page_info["data_attributes"][attr_name] = decoded[:200]
+
+                    # Look for script tags with JSON assignments
+                    script_data = re.findall(
+                        r'<script[^>]*>\s*(?:var|const|let|window\.)\s*(\w+)\s*=\s*({.+?})\s*;?\s*</script>',
+                        resp.text,
+                        re.DOTALL,
+                    )
+                    if script_data:
+                        page_info["script_vars"] = {}
+                        for var_name, var_value in script_data[:5]:
+                            try:
+                                parsed = json.loads(var_value)
+                                page_info["script_vars"][var_name] = (
+                                    self._deep_summarize(parsed)
+                                    if isinstance(parsed, dict)
+                                    else parsed
+                                )
+                            except (json.JSONDecodeError, ValueError):
+                                page_info["script_vars"][var_name] = var_value[:200]
+                else:
+                    page_info["body_preview"] = resp.text[:300] if resp.text else ""
+            except Exception as e:
+                page_info["error"] = str(e)
+
+            result["pages"][page_path] = page_info
+
+        return result
+
+    def _deep_summarize(self, d: dict, max_depth: int = 3, current_depth: int = 0) -> Any:
+        """Recursively summarize a dict, showing structure and small values."""
+        if current_depth >= max_depth:
+            return f"dict({len(d)} keys: {list(d.keys())[:5]})"
+
+        summary = {}
+        for k, v in list(d.items())[:30]:
+            if v is None:
+                summary[k] = None
+            elif isinstance(v, bool):
+                summary[k] = v
+            elif isinstance(v, (int, float)):
+                summary[k] = v
+            elif isinstance(v, str):
+                summary[k] = v if len(v) <= 100 else f"str({len(v)} chars): {v[:80]}..."
+            elif isinstance(v, list):
+                if not v:
+                    summary[k] = []
+                elif isinstance(v[0], dict):
+                    summary[k] = f"list({len(v)} dicts)"
+                    if len(v) > 0:
+                        summary[k + "[0]"] = self._deep_summarize(
+                            v[0], max_depth, current_depth + 1
+                        )
+                else:
+                    summary[k] = v[:10] if len(v) <= 10 else f"list({len(v)}): {v[:5]}..."
+            elif isinstance(v, dict):
+                summary[k] = self._deep_summarize(v, max_depth, current_depth + 1)
+        return summary
 
     # --- Appointments ---
 

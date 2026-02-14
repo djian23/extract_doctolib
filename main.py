@@ -70,3 +70,16 @@ def debug_endpoints():
     if not client.is_authenticated:
         raise HTTPException(status_code=401, detail="Non authentifié.")
     return client.debug_api_test()
+
+
+@app.get("/debug/dashboard", tags=["Debug"])
+def debug_dashboard():
+    """
+    Charge le dashboard Doctolib Pro et retourne les données embarquées (data-props).
+    Utile pour voir ce que le SPA contient comme données initiales.
+    """
+    from fastapi import HTTPException
+    client = app.state.doctolib_client
+    if not client.is_authenticated:
+        raise HTTPException(status_code=401, detail="Non authentifié.")
+    return client.debug_dashboard()
