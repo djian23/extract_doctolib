@@ -296,25 +296,29 @@ class DoctolibClient:
     def submit_2fa_code(self, code: str) -> dict[str, Any]:
         """Submit 2FA authentication code.
 
-        Uses PUT /api/accounts/two_factor_authentication (confirmed working).
-        Falls back to POST if PUT fails.
+        Flow:
+        1. PUT /api/accounts/two_factor_authentication (validates code, no redirect follow)
+        2. Re-POST /login.json (now 2FA is validated, should return account data)
         """
-        strategies = [
-            ("PUT", "/api/accounts/two_factor_authentication", {"auth_code": code}),
-            ("POST", "/api/accounts/two_factor_authentication", {"auth_code": code}),
-        ]
-
         all_attempts = []
-        for method, endpoint, payload in strategies:
+
+        # Step 1: Validate 2FA code via PUT (no redirect following)
+        tfa_validated = False
+        for method in ("PUT", "POST"):
+            endpoint = "/api/accounts/two_factor_authentication"
+            payload = {"auth_code": code}
             try:
                 if method == "PUT":
-                    resp = self.session.put(self._url(endpoint), json=payload)
+                    resp = self.session.put(
+                        self._url(endpoint), json=payload, allow_redirects=False
+                    )
                 else:
-                    resp = self.session.post(self._url(endpoint), json=payload)
+                    resp = self.session.post(
+                        self._url(endpoint), json=payload, allow_redirects=False
+                    )
                 logger.info(f"2FA {method} [{endpoint}]: HTTP {resp.status_code}")
 
                 resp_data = None
-                resp_text = resp.text[:500] if resp.text else ""
                 try:
                     resp_data = resp.json()
                 except ValueError:
@@ -325,52 +329,123 @@ class DoctolibClient:
                     "endpoint": endpoint,
                     "status": resp.status_code,
                     "data": resp_data,
-                    "body_preview": resp_text[:300] if resp_data is None else None,
+                    "body_preview": resp.text[:300] if resp_data is None and resp.text else None,
+                    "location": resp.headers.get("Location"),
                     "set_cookie_headers": [
                         v for k, v in resp.headers.items() if k.lower() == "set-cookie"
                     ][:5],
+                    "redirect_history": [
+                        {"url": r.url, "status": r.status_code}
+                        for r in resp.history
+                    ] if hasattr(resp, "history") else [],
                 }
                 all_attempts.append(attempt_info)
 
+                # 2xx or 3xx = code validated
                 if resp.status_code < 400:
-                    # Check for 2FA redirect loop
+                    tfa_validated = True
+
+                    # If JSON response with account data, use it directly
                     if isinstance(resp_data, dict):
                         redir = resp_data.get("redirect") or resp_data.get("redirection")
                         if redir and "two-factor" in str(redir):
-                            logger.info(f"2FA [{endpoint}]: still redirecting to 2FA")
+                            tfa_validated = False
                             continue
                         self._extract_token(resp_data)
                         if any(k in resp_data for k in ("doctor", "agendas", "id")):
                             self._account_data = resp_data
 
-                    # Extract CSRF from HTML response
+                    # Extract CSRF from HTML if present
                     if resp_data is None and resp.text:
                         self._extract_csrf_token(resp.text)
 
+                    break
+            except Exception as e:
+                all_attempts.append({"method": method, "endpoint": endpoint, "error": str(e)})
+                logger.warning(f"2FA {method} [{endpoint}] failed: {e}")
+                continue
+
+        if not tfa_validated:
+            return {
+                "success": False,
+                "requires_2fa": True,
+                "message": "Code 2FA invalide.",
+                "debug": all_attempts,
+            }
+
+        # Step 2: Re-login now that 2FA is validated
+        # The 2FA validation marks the session's 2FA as complete,
+        # but we need to POST /login.json again to get the authenticated session
+        relogin_info = {}
+        login_payload = {
+            "kind": "doctor",
+            "username": self.email,
+            "password": self.password,
+            "remember": True,
+            "remember_username": True,
+        }
+        try:
+            resp = self.session.post(self._url("/login.json"), json=login_payload)
+            relogin_info = {
+                "status": resp.status_code,
+                "body_preview": resp.text[:500] if resp.text else "",
+            }
+            try:
+                data = resp.json()
+                relogin_info["data_keys"] = list(data.keys())[:20]
+
+                # Check if still asking for 2FA
+                redir = data.get("redirect") or data.get("redirection")
+                if redir and "two-factor" in str(redir):
+                    relogin_info["still_needs_2fa"] = True
+                else:
+                    # Success! We have the authenticated session with account data
+                    relogin_info["still_needs_2fa"] = False
+                    self._account_data = data
+                    self._extract_token(data)
                     self._authenticated = True
                     self._requires_2fa = False
+            except ValueError:
+                relogin_info["json_parse_error"] = True
+        except Exception as e:
+            relogin_info["error"] = str(e)
 
-                    # Complete session setup
-                    session_debug = self._complete_session()
+        all_attempts.append({"step": "re-login", **relogin_info})
 
-                    return {
-                        "success": True,
-                        "requires_2fa": False,
-                        "message": f"2FA réussie via {method} {endpoint}.",
-                        "debug": {
-                            "attempts": all_attempts,
-                            "session_setup": session_debug,
-                        },
-                    }
-            except Exception as e:
-                all_attempts.append({"endpoint": endpoint, "error": str(e)})
-                logger.warning(f"2FA [{endpoint}] failed: {e}")
-                continue
+        if self._authenticated:
+            # Complete session setup
+            session_debug = self._complete_session()
+            return {
+                "success": True,
+                "requires_2fa": False,
+                "message": "2FA validée et session authentifiée.",
+                "debug": {
+                    "attempts": all_attempts,
+                    "session_setup": session_debug,
+                },
+            }
+
+        # Step 3: If re-login still needs 2FA, try www.doctolib.fr
+        www_info = {}
+        try:
+            resp = self.session.get("https://www.doctolib.fr/")
+            www_info["status"] = resp.status_code
+            www_info["content_type"] = resp.headers.get("content-type", "")
+            if resp.status_code == 200 and "text/html" in www_info["content_type"]:
+                embedded = self._extract_embedded_data(resp.text)
+                if embedded:
+                    www_info["embedded_keys"] = list(embedded.keys())
+                    for key, value in embedded.items():
+                        if isinstance(value, dict):
+                            www_info[f"{key}_keys"] = list(value.keys())[:20]
+        except Exception as e:
+            www_info["error"] = str(e)
+        all_attempts.append({"step": "www_test", **www_info})
 
         return {
             "success": False,
             "requires_2fa": True,
-            "message": "Code 2FA invalide.",
+            "message": "2FA validée mais session non authentifiée. Re-login échoué.",
             "debug": all_attempts,
         }
 
