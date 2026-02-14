@@ -206,13 +206,21 @@ class DoctolibClient:
         self.session = cloudscraper.create_scraper()
         self.session.headers.update(self.DEFAULT_HEADERS)
 
+    def _get_agenda_ids(self) -> str:
+        """Extract agenda IDs from account data."""
+        agendas = []
+        doctor = self._account_data.get("doctor", {})
+        for agenda in doctor.get("agendas", []):
+            agendas.append(str(agenda.get("id", "")))
+        return "-".join(agendas) if agendas else ""
+
     # --- Appointments ---
 
     def get_appointments(
         self,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-    ) -> dict[str, Any]:
+    ) -> Any:
         """
         Fetch appointments list.
 
@@ -220,28 +228,82 @@ class DoctolibClient:
             start_date: Format YYYY-MM-DD (default: today)
             end_date: Format YYYY-MM-DD (default: +30 days)
         """
+        from datetime import timedelta
+
         if not start_date:
             start_date = date.today().isoformat()
         if not end_date:
-            from datetime import timedelta
             end_date = (date.today() + timedelta(days=30)).isoformat()
 
-        params = {
-            "start_date": start_date,
-            "end_date": end_date,
-        }
+        agenda_ids = self._get_agenda_ids()
 
-        return self._get_json("/appointments.json", params=params)
+        # Try multiple known Doctolib Pro endpoints
+        endpoints = [
+            ("/api/events.json", {
+                "start_date": start_date,
+                "end_date": end_date,
+                **({"agenda_ids": agenda_ids} if agenda_ids else {}),
+            }),
+            ("/events.json", {
+                "start_date": start_date,
+                "end_date": end_date,
+                **({"agenda_ids": agenda_ids} if agenda_ids else {}),
+            }),
+            ("/calendar/events.json", {
+                "start_date": start_date,
+                "end_date": end_date,
+            }),
+            ("/appointments.json", {
+                "start_date": start_date,
+                "end_date": end_date,
+            }),
+        ]
+
+        for path, params in endpoints:
+            try:
+                resp = self.session.get(self._url(path), params=params)
+                logger.info(f"Appointments attempt {path}: HTTP {resp.status_code}")
+                if resp.status_code < 400:
+                    return resp.json()
+            except Exception as e:
+                logger.warning(f"Appointments attempt {path} failed: {e}")
+                continue
+
+        raise RuntimeError(f"Aucun endpoint n'a fonctionné pour les rendez-vous.")
 
     def get_appointment(self, appointment_id: int) -> dict[str, Any]:
         """Fetch details of a specific appointment."""
-        return self._get_json(f"/appointments/{appointment_id}/edit.json")
+        for path in [
+            f"/api/events/{appointment_id}.json",
+            f"/appointments/{appointment_id}/edit.json",
+            f"/appointments/{appointment_id}.json",
+        ]:
+            try:
+                resp = self.session.get(self._url(path))
+                if resp.status_code < 400:
+                    return resp.json()
+            except Exception:
+                continue
+        raise RuntimeError(f"Rendez-vous {appointment_id} non trouvé.")
 
     # --- Patients ---
 
-    def get_patients(self) -> dict[str, Any]:
+    def get_patients(self) -> Any:
         """Fetch master patients list."""
-        return self._get_json("/account/master_patients.json")
+        for path in [
+            "/api/patients.json",
+            "/api/master_patients.json",
+            "/account/master_patients.json",
+        ]:
+            try:
+                resp = self.session.get(self._url(path))
+                logger.info(f"Patients attempt {path}: HTTP {resp.status_code}")
+                if resp.status_code < 400:
+                    return resp.json()
+            except Exception as e:
+                logger.warning(f"Patients attempt {path} failed: {e}")
+                continue
+        raise RuntimeError("Aucun endpoint n'a fonctionné pour les patients.")
 
     # --- Availabilities ---
 

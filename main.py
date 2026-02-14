@@ -47,3 +47,13 @@ def root():
         "authenticated": client.is_authenticated,
         "docs": "/docs",
     }
+
+
+@app.get("/account", tags=["Compte"])
+def account_info():
+    """Retourne les données du compte Doctolib (agendas, IDs, etc.)."""
+    from fastapi import HTTPException
+    client = app.state.doctolib_client
+    if not client.is_authenticated:
+        raise HTTPException(status_code=401, detail="Non authentifié.")
+    return client.get_account_info()
