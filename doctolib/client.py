@@ -5,7 +5,7 @@ import time
 from datetime import date, datetime
 from typing import Any, Optional
 
-import cloudscraper
+from curl_cffi.requests import Session as CurlSession
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ class DoctolibClient:
         self._admin_base_url: Optional[str] = None
         self._session_debug: dict[str, Any] = {}
 
-        self.session = cloudscraper.create_scraper()
+        self.session = CurlSession(impersonate="chrome")
         self.session.headers.update(self.BROWSER_HEADERS)
 
     @property
@@ -95,12 +95,6 @@ class DoctolibClient:
         # Step 1: Initialize session (get cookies, CSRF token)
         try:
             resp = self.session.get(self._url("/sessions/new"))
-            if resp.status_code in (503, 520):
-                return {
-                    "success": False,
-                    "requires_2fa": False,
-                    "message": "Bloqué par Cloudflare. Réessayez plus tard.",
-                }
             if resp.status_code == 200:
                 self._extract_csrf_token(resp.text)
         except Exception as e:
@@ -164,7 +158,7 @@ class DoctolibClient:
                     "Accept": "application/json",
                     "Content-Type": "application/json",
                     "X-Requested-With": "XMLHttpRequest",
-                    "Referer": f"{self.base_url}/signin/two-factor",
+                    "Referer": f"{self.base_url}/sessions/new",
                 }
                 if self._csrf_token:
                     send_headers["X-CSRF-Token"] = self._csrf_token
@@ -194,16 +188,11 @@ class DoctolibClient:
     def resend_2fa_code(self) -> dict[str, Any]:
         """Resend the 2FA code via email."""
         try:
-            # Visit 2FA page first to refresh session state
-            resp = self.session.get(self._url("/signin/two-factor"))
-            if resp.status_code == 200:
-                self._extract_csrf_token(resp.text)
-
             headers = {
                 "Accept": "application/json",
                 "Content-Type": "application/json",
                 "X-Requested-With": "XMLHttpRequest",
-                "Referer": f"{self.base_url}/signin/two-factor",
+                "Referer": f"{self.base_url}/sessions/new",
             }
             if self._csrf_token:
                 headers["X-CSRF-Token"] = self._csrf_token
@@ -336,33 +325,19 @@ class DoctolibClient:
         """Submit 2FA authentication code.
 
         Flow:
-        1. Visit /signin/two-factor to get proper session state + CSRF
-        2. PUT /api/accounts/two_factor_authentication with proper headers
-        3. Re-POST /login.json to complete authentication
+        1. PUT /api/accounts/two_factor_authentication with existing session + CSRF
+        2. Re-POST /login.json to complete authentication
         """
         all_attempts = []
 
-        # Step 1: Visit the 2FA page to get proper session state and CSRF token
-        try:
-            resp = self.session.get(self._url("/signin/two-factor"))
-            if resp.status_code == 200:
-                self._extract_csrf_token(resp.text)
-            all_attempts.append({
-                "step": "visit_2fa_page",
-                "status": resp.status_code,
-                "csrf_extracted": bool(self._csrf_token),
-            })
-        except Exception as e:
-            all_attempts.append({"step": "visit_2fa_page", "error": str(e)})
-
-        # Step 2: Validate 2FA code via PUT with proper headers
+        # Step 1: Validate 2FA code via PUT (use existing session, no page visit)
         endpoint = "/api/accounts/two_factor_authentication"
         tfa_validated = False
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
             "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"{self.base_url}/signin/two-factor",
+            "Referer": f"{self.base_url}/sessions/new",
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
@@ -629,7 +604,7 @@ class DoctolibClient:
 
         # Step 5: Record session state
         debug["cookies"] = {}
-        for cookie in self.session.cookies:
+        for cookie in self.session.cookies.jar:
             domain = cookie.domain
             if domain not in debug["cookies"]:
                 debug["cookies"][domain] = []
@@ -657,7 +632,7 @@ class DoctolibClient:
         self._csrf_token = None
         self._admin_base_url = None
         self._session_debug = {}
-        self.session = cloudscraper.create_scraper()
+        self.session = CurlSession(impersonate="chrome")
         self.session.headers.update(self.BROWSER_HEADERS)
 
     def _get_agenda_ids(self) -> str:
@@ -766,7 +741,7 @@ class DoctolibClient:
 
         # Show all cookies with domain details
         results["cookies"] = {}
-        for cookie in self.session.cookies:
+        for cookie in self.session.cookies.jar:
             domain = cookie.domain
             if domain not in results["cookies"]:
                 results["cookies"][domain] = []
