@@ -21,17 +21,12 @@ class DoctolibClient:
         ),
     }
 
-    # Login happens on pro.doctolib.fr, but API is on admin.doctolib.fr
-    API_BASE_URL = "https://admin.doctolib.fr"
-
     def __init__(self, base_url: str, email: str, password: str):
         self.base_url = base_url.rstrip("/")
-        self.api_base_url = self.API_BASE_URL
         self.email = email
         self.password = password
         self._authenticated = False
         self._requires_2fa = False
-        self._api_session_established = False
         self._account_data: dict[str, Any] = {}
 
         self.session = cloudscraper.create_scraper()
@@ -46,26 +41,29 @@ class DoctolibClient:
         return self._requires_2fa
 
     def _url(self, path: str) -> str:
-        """URL for auth endpoints (pro.doctolib.fr)."""
         return f"{self.base_url}{path}"
 
-    def _api_url(self, path: str) -> str:
-        """URL for data/API endpoints (admin.doctolib.fr)."""
-        return f"{self.api_base_url}{path}"
-
-    def _get_json(self, path: str, params: Optional[dict] = None) -> dict[str, Any]:
-        """GET request on API domain returning JSON. Raises on HTTP error."""
-        resp = self.session.get(self._api_url(path), params=params)
-        resp.raise_for_status()
-        return resp.json()
-
-    def _post_json(self, path: str, json_data: Optional[dict] = None) -> dict[str, Any]:
-        """POST request on API domain with JSON body, returning JSON."""
-        resp = self.session.post(self._api_url(path), json=json_data)
-        resp.raise_for_status()
-        return resp.json()
-
     # --- Authentication ---
+
+    def _do_login(self, extra_payload: Optional[dict] = None) -> Any:
+        """POST /login.json with optional extra fields. Returns (resp, data)."""
+        payload = {
+            "kind": "doctor",
+            "username": self.email,
+            "password": self.password,
+            "remember": True,
+            "remember_username": True,
+        }
+        if extra_payload:
+            payload.update(extra_payload)
+
+        resp = self.session.post(self._url("/login.json"), json=payload)
+        data = None
+        try:
+            data = resp.json()
+        except ValueError:
+            pass
+        return resp, data
 
     def login(self) -> dict[str, Any]:
         """
@@ -93,16 +91,8 @@ class DoctolibClient:
             }
 
         # Step 2: POST login credentials
-        login_payload = {
-            "kind": "doctor",
-            "username": self.email,
-            "password": self.password,
-            "remember": True,
-            "remember_username": True,
-        }
-
         try:
-            resp = self.session.post(self._url("/login.json"), json=login_payload)
+            resp, data = self._do_login()
         except Exception as e:
             return {
                 "success": False,
@@ -124,9 +114,7 @@ class DoctolibClient:
                 "message": f"Erreur HTTP {resp.status_code}: {resp.text[:200]}",
             }
 
-        try:
-            data = resp.json()
-        except ValueError:
+        if data is None:
             return {
                 "success": False,
                 "requires_2fa": False,
@@ -134,6 +122,7 @@ class DoctolibClient:
             }
 
         self._account_data = data
+        logger.info(f"Login response keys: {list(data.keys())}")
 
         # Step 3: Check if 2FA is required
         redirect = data.get("redirect") or data.get("redirection")
@@ -153,6 +142,7 @@ class DoctolibClient:
                 "message": "Code 2FA envoyé par email. Soumettez-le via POST /auth/2fa.",
             }
 
+        # No 2FA needed - login complete
         self._authenticated = True
         return {
             "success": True,
@@ -162,159 +152,100 @@ class DoctolibClient:
 
     def submit_2fa_code(self, code: str) -> dict[str, Any]:
         """Submit 2FA authentication code."""
-        # Try multiple known Doctolib 2FA endpoints
-        endpoints = [
-            ("/api/accounts/two_factor_authentication", {"auth_code": code}),
-            ("/login.json", {
-                "kind": "doctor",
-                "username": self.email,
-                "password": self.password,
-                "auth_code": code,
-                "two_factor_auth_method": "email",
-            }),
-        ]
-
-        last_resp = None
-        for endpoint, payload in endpoints:
+        # Step 1: Validate the 2FA code
+        tfa_validated = False
+        try:
+            resp = self.session.post(
+                self._url("/api/accounts/two_factor_authentication"),
+                json={"auth_code": code},
+            )
+            logger.info(f"2FA validation: HTTP {resp.status_code}")
             try:
-                resp = self.session.post(self._url(endpoint), json=payload)
-                last_resp = resp
-                logger.info(f"2FA attempt on {endpoint}: HTTP {resp.status_code}")
-                if resp.status_code < 400:
-                    # Try to capture response data
-                    try:
-                        resp_data = resp.json()
-                        if resp_data and isinstance(resp_data, dict):
-                            # If the 2FA response contains account data, store it
-                            if "doctor" in resp_data or "agendas" in resp_data:
-                                self._account_data = resp_data
-                                logger.info("Account data updated from 2FA response")
-                    except ValueError:
-                        pass
-                    break
+                tfa_data = resp.json()
+                logger.info(f"2FA response keys: {list(tfa_data.keys()) if isinstance(tfa_data, dict) else type(tfa_data)}")
+            except ValueError:
+                tfa_data = None
+            if resp.status_code < 400:
+                tfa_validated = True
+        except Exception as e:
+            logger.warning(f"2FA validation endpoint failed: {e}")
+
+        if not tfa_validated:
+            # Fallback: try login.json with auth_code included
+            try:
+                resp, data = self._do_login(extra_payload={
+                    "auth_code": code,
+                    "two_factor_auth_method": "email",
+                })
+                logger.info(f"2FA via login.json: HTTP {resp.status_code}")
+                if resp.status_code < 400 and data:
+                    self._account_data = data
+                    self._authenticated = True
+                    self._requires_2fa = False
+                    logger.info(f"Login+2FA combined success, keys: {list(data.keys())}")
+                    return {
+                        "success": True,
+                        "requires_2fa": False,
+                        "message": "Authentification 2FA réussie.",
+                    }
             except Exception as e:
-                logger.warning(f"2FA attempt on {endpoint} failed: {e}")
-                continue
+                logger.warning(f"Combined login+2FA failed: {e}")
 
-        if last_resp is None:
             return {
                 "success": False,
                 "requires_2fa": True,
-                "message": "Erreur réseau sur tous les endpoints 2FA.",
+                "message": f"Code 2FA invalide.",
             }
 
-        if last_resp.status_code >= 400:
-            return {
-                "success": False,
-                "requires_2fa": True,
-                "message": f"Code 2FA invalide (HTTP {last_resp.status_code}).",
-            }
+        # Step 2: 2FA validated - now re-login to complete the session
+        # The 2FA endpoint only validates the code in the session.
+        # We need to POST /login.json again to get the full account data.
+        logger.info("2FA validated, re-submitting login to complete session...")
+        try:
+            resp, data = self._do_login()
+            logger.info(f"Post-2FA re-login: HTTP {resp.status_code}")
+            if resp.status_code < 400 and data:
+                logger.info(f"Post-2FA login keys: {list(data.keys())}")
+                # Check if we got real account data (not another 2FA challenge)
+                redirect = data.get("redirect") or data.get("redirection")
+                if redirect and "two-factor" in str(redirect):
+                    logger.warning("Still getting 2FA challenge after code validation")
+                    # Try the combined approach
+                    resp2, data2 = self._do_login(extra_payload={
+                        "auth_code": code,
+                        "two_factor_auth_method": "email",
+                    })
+                    logger.info(f"Combined login+2FA: HTTP {resp2.status_code}")
+                    if resp2.status_code < 400 and data2:
+                        data = data2
+                        logger.info(f"Combined login+2FA keys: {list(data.keys())}")
 
+                self._account_data = data
+                self._authenticated = True
+                self._requires_2fa = False
+                return {
+                    "success": True,
+                    "requires_2fa": False,
+                    "message": "Authentification 2FA réussie.",
+                }
+        except Exception as e:
+            logger.warning(f"Post-2FA re-login failed: {e}")
+
+        # If re-login didn't work, still mark as authenticated
+        # (the 2FA was validated successfully)
         self._authenticated = True
         self._requires_2fa = False
-
-        # Establish session on admin.doctolib.fr (the API domain)
-        self._establish_api_session()
-
-        # Re-fetch full account data from the API domain
-        self._refresh_account_data()
-
         return {
             "success": True,
             "requires_2fa": False,
-            "message": "Authentification 2FA réussie.",
+            "message": "Authentification 2FA réussie (session partielle).",
         }
-
-    def _establish_api_session(self) -> None:
-        """
-        After auth on pro.doctolib.fr, establish session on admin.doctolib.fr.
-        Doctolib redirects from pro → admin after login.
-        """
-        # Check if the 2FA/login response had a redirection hint
-        redirect_url = self._account_data.get("redirection", "")
-        if redirect_url and "admin.doctolib" in str(redirect_url):
-            target = str(redirect_url).rstrip("/")
-            if not target.startswith("http"):
-                target = f"https://{target}"
-            self.api_base_url = target
-            logger.info(f"API base URL set from redirection: {self.api_base_url}")
-
-        # Visit the admin domain to transfer/establish session cookies
-        try:
-            resp = self.session.get(self.api_base_url, allow_redirects=True)
-            logger.info(
-                f"Admin session init: HTTP {resp.status_code}, "
-                f"URL: {resp.url}, cookies: {list(self.session.cookies.keys())}"
-            )
-            self._api_session_established = resp.status_code < 400
-        except Exception as e:
-            logger.warning(f"Failed to establish admin session: {e}")
-
-        # Also try the login.json on admin domain to transfer auth
-        try:
-            login_payload = {
-                "kind": "doctor",
-                "username": self.email,
-                "password": self.password,
-                "remember": True,
-                "remember_username": True,
-            }
-            resp = self.session.post(
-                f"{self.api_base_url}/login.json",
-                json=login_payload,
-            )
-            logger.info(f"Admin login: HTTP {resp.status_code}")
-            if resp.status_code < 400:
-                try:
-                    data = resp.json()
-                    if isinstance(data, dict) and "doctor" in data:
-                        self._account_data = data
-                        self._api_session_established = True
-                        logger.info(f"Account data from admin login, keys: {list(data.keys())[:10]}")
-                except ValueError:
-                    pass
-        except Exception as e:
-            logger.warning(f"Admin login attempt failed: {e}")
-
-    def _refresh_account_data(self) -> None:
-        """Fetch full account data after authentication."""
-        # Try on the API domain (admin.doctolib.fr)
-        account_endpoints = [
-            (self.api_base_url, "/account.json"),
-            (self.api_base_url, "/api/account.json"),
-            (self.api_base_url, "/api/accounts/current.json"),
-            # Fallback to auth domain
-            (self.base_url, "/account.json"),
-            (self.base_url, "/api/accounts/current.json"),
-        ]
-        for base, path in account_endpoints:
-            try:
-                url = f"{base}{path}"
-                resp = self.session.get(url)
-                logger.info(f"Account refresh {url}: HTTP {resp.status_code}")
-                if resp.status_code < 400:
-                    data = resp.json()
-                    if data and isinstance(data, dict):
-                        # Only update if it looks like real account data
-                        if any(k in data for k in ("doctor", "agendas", "id", "name")):
-                            self._account_data = data
-                            logger.info(
-                                f"Account data refreshed from {url}, "
-                                f"keys: {list(data.keys())[:10]}"
-                            )
-                            return
-            except Exception as e:
-                logger.warning(f"Account refresh {base}{path} failed: {e}")
-                continue
-        logger.warning("Could not refresh account data from any endpoint")
 
     def logout(self) -> None:
         """Reset session."""
         self._authenticated = False
         self._requires_2fa = False
-        self._api_session_established = False
         self._account_data = {}
-        self.api_base_url = self.API_BASE_URL
         self.session = cloudscraper.create_scraper()
         self.session.headers.update(self.DEFAULT_HEADERS)
 
@@ -374,46 +305,43 @@ class DoctolibClient:
         base_params = {"start_date": start_date, "end_date": end_date}
         params_with_agendas = {**base_params, **({"agenda_ids": agenda_ids} if agenda_ids else {})}
 
-        api_paths = [
+        endpoints = [
+            ("/api/appointments.json", params_with_agendas),
             ("/api/events.json", params_with_agendas),
             ("/events.json", params_with_agendas),
-            ("/api/appointments.json", params_with_agendas),
             ("/appointments.json", base_params),
         ]
 
-        # If we have individual agenda IDs, also try per-agenda endpoints
+        # Per-agenda endpoints
         if agenda_ids:
             for aid in agenda_ids.split("-"):
-                api_paths.append((f"/api/agendas/{aid}/events.json", base_params))
-
-        # Build full URL list: try API domain first, then auth domain as fallback
-        endpoints: list[tuple[str, str, dict]] = []
-        for path, params in api_paths:
-            endpoints.append((self.api_base_url, path, params))
-        for path, params in api_paths:
-            endpoints.append((self.base_url, path, params))
+                endpoints.append((f"/api/agendas/{aid}/events.json", base_params))
 
         errors = []
-        for base, path, params in endpoints:
+        for path, params in endpoints:
             try:
-                url = f"{base}{path}"
+                url = self._url(path)
                 resp = self.session.get(url, params=params)
                 status = resp.status_code
                 body_preview = resp.text[:200] if resp.text else "(empty)"
-                logger.info(f"Appointments {url}: HTTP {status} | Body: {body_preview}")
+                logger.info(f"Appointments {path}: HTTP {status} | Body: {body_preview}")
                 if status < 400:
+                    ct = resp.headers.get("content-type", "")
+                    if "json" not in ct and "html" in ct:
+                        errors.append(f"{path}: HTTP {status} but HTML response")
+                        continue
                     try:
                         data = resp.json()
                         if isinstance(data, (list, dict)):
                             return data
                     except ValueError:
-                        errors.append(f"{url}: HTTP {status} invalid JSON")
+                        errors.append(f"{path}: HTTP {status} invalid JSON")
                         continue
                 else:
-                    errors.append(f"{url}: HTTP {status}")
+                    errors.append(f"{path}: HTTP {status}")
             except Exception as e:
-                errors.append(f"{base}{path}: {e}")
-                logger.warning(f"Appointments attempt {base}{path} failed: {e}")
+                errors.append(f"{path}: {e}")
+                logger.warning(f"Appointments attempt {path} failed: {e}")
                 continue
 
         error_details = "; ".join(errors)
@@ -424,47 +352,45 @@ class DoctolibClient:
 
     def get_appointment(self, appointment_id: int) -> dict[str, Any]:
         """Fetch details of a specific appointment."""
-        paths = [
-            f"/api/events/{appointment_id}.json",
+        for path in [
             f"/api/appointments/{appointment_id}.json",
+            f"/api/events/{appointment_id}.json",
             f"/appointments/{appointment_id}/edit.json",
             f"/appointments/{appointment_id}.json",
-        ]
-        for base in [self.api_base_url, self.base_url]:
-            for path in paths:
-                try:
-                    url = f"{base}{path}"
-                    resp = self.session.get(url)
-                    if resp.status_code < 400:
-                        return resp.json()
-                except Exception:
-                    continue
+        ]:
+            try:
+                resp = self.session.get(self._url(path))
+                if resp.status_code < 400:
+                    return resp.json()
+            except Exception:
+                continue
         raise RuntimeError(f"Rendez-vous {appointment_id} non trouvé.")
 
     # --- Patients ---
 
     def get_patients(self) -> Any:
         """Fetch master patients list."""
-        paths = [
+        errors = []
+        for path in [
             "/api/patients.json",
             "/api/master_patients.json",
             "/account/master_patients.json",
-        ]
-        errors = []
-        for base in [self.api_base_url, self.base_url]:
-            for path in paths:
-                try:
-                    url = f"{base}{path}"
-                    resp = self.session.get(url)
-                    logger.info(f"Patients {url}: HTTP {resp.status_code}")
-                    if resp.status_code < 400:
-                        return resp.json()
-                    else:
-                        errors.append(f"{url}: HTTP {resp.status_code}")
-                except Exception as e:
-                    errors.append(f"{base}{path}: {e}")
-                    logger.warning(f"Patients attempt {base}{path} failed: {e}")
-                    continue
+        ]:
+            try:
+                resp = self.session.get(self._url(path))
+                logger.info(f"Patients {path}: HTTP {resp.status_code}")
+                if resp.status_code < 400:
+                    ct = resp.headers.get("content-type", "")
+                    if "json" not in ct and "html" in ct:
+                        errors.append(f"{path}: HTTP {resp.status_code} but HTML")
+                        continue
+                    return resp.json()
+                else:
+                    errors.append(f"{path}: HTTP {resp.status_code}")
+            except Exception as e:
+                errors.append(f"{path}: {e}")
+                logger.warning(f"Patients attempt {path} failed: {e}")
+                continue
         raise RuntimeError(f"Aucun endpoint n'a fonctionné pour les patients. Détails: {'; '.join(errors)}")
 
     # --- Availabilities ---
@@ -500,7 +426,9 @@ class DoctolibClient:
             "limit": limit,
         }
 
-        return self._get_json("/availabilities.json", params=params)
+        resp = self.session.get(self._url("/availabilities.json"), params=params)
+        resp.raise_for_status()
+        return resp.json()
 
     # --- Account ---
 

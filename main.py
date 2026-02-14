@@ -62,7 +62,7 @@ def account_info():
 @app.get("/debug/endpoints", tags=["Debug"])
 def debug_endpoints():
     """
-    Teste plusieurs endpoints sur les deux domaines Doctolib.
+    Teste plusieurs endpoints Doctolib Pro et retourne les résultats.
     Utile pour identifier les bons chemins d'API.
     """
     from fastapi import HTTPException
@@ -75,47 +75,45 @@ def debug_endpoints():
         "/events.json",
         "/api/appointments.json",
         "/appointments.json",
-        "/account.json",
-        "/api/account.json",
         "/api/patients.json",
         "/api/master_patients.json",
     ]
 
     agenda_ids = client._get_agenda_ids()
     results = {
-        "auth_base_url": client.base_url,
-        "api_base_url": client.api_base_url,
-        "api_session_established": client._api_session_established,
+        "base_url": client.base_url,
         "agenda_ids": agenda_ids,
         "account_keys": list(client._account_data.keys())[:20],
-        "cookies": list(client.session.cookies.keys()),
+        "cookies_domains": {},
         "endpoints": [],
     }
 
-    # Test paths on both domains
-    for base_label, base_url in [("admin", client.api_base_url), ("pro", client.base_url)]:
-        for path in test_paths:
-            try:
-                params = {"start_date": "2026-02-14", "end_date": "2026-02-15"}
-                if agenda_ids and "event" in path:
-                    params["agenda_ids"] = agenda_ids
-                url = f"{base_url}{path}"
-                resp = client.session.get(url, params=params)
-                body = resp.text[:300] if resp.text else ""
-                results["endpoints"].append({
-                    "domain": base_label,
-                    "path": path,
-                    "full_url": url,
-                    "status": resp.status_code,
-                    "content_type": resp.headers.get("content-type", ""),
-                    "body_preview": body,
-                })
-            except Exception as e:
-                results["endpoints"].append({
-                    "domain": base_label,
-                    "path": path,
-                    "status": "error",
-                    "error": str(e),
-                })
+    # Show cookies per domain
+    for cookie in client.session.cookies:
+        domain = cookie.domain
+        if domain not in results["cookies_domains"]:
+            results["cookies_domains"][domain] = []
+        results["cookies_domains"][domain].append(cookie.name)
+
+    for path in test_paths:
+        try:
+            params = {"start_date": "2026-02-14", "end_date": "2026-02-15"}
+            if agenda_ids and "event" in path:
+                params["agenda_ids"] = agenda_ids
+            url = client._url(path)
+            resp = client.session.get(url, params=params)
+            body = resp.text[:500] if resp.text else ""
+            results["endpoints"].append({
+                "path": path,
+                "status": resp.status_code,
+                "content_type": resp.headers.get("content-type", ""),
+                "body_preview": body,
+            })
+        except Exception as e:
+            results["endpoints"].append({
+                "path": path,
+                "status": "error",
+                "error": str(e),
+            })
 
     return results
