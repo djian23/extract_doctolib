@@ -44,6 +44,7 @@ class DoctolibClient:
         self._requires_2fa = False
         self._account_data: dict[str, Any] = {}
         self._auth_token: Optional[str] = None
+        self._csrf_token: Optional[str] = None
         self._tfa_response: Optional[dict] = None  # Store 2FA response for debug
 
         self.session = cloudscraper.create_scraper()
@@ -65,6 +66,8 @@ class DoctolibClient:
         headers = {**self.API_HEADERS}
         if self._auth_token:
             headers["Authorization"] = f"Bearer {self._auth_token}"
+        if self._csrf_token:
+            headers["X-CSRF-Token"] = self._csrf_token
         return self.session.get(self._url(path), params=params, headers=headers)
 
     # --- Authentication ---
@@ -176,26 +179,26 @@ class DoctolibClient:
                 logger.info(f"Auth token extracted from '{key}' ({len(val)} chars)")
                 return
 
+    def _extract_csrf_token(self, html: str) -> None:
+        """Extract CSRF token from HTML meta tag (Rails convention)."""
+        import re
+        match = re.search(r'name="csrf-token"\s+content="([^"]+)"', html)
+        if match:
+            self._csrf_token = match.group(1)
+            logger.info(f"CSRF token extracted ({len(self._csrf_token)} chars)")
+        else:
+            self._csrf_token = None
+
     def submit_2fa_code(self, code: str) -> dict[str, Any]:
         """Submit 2FA authentication code.
 
         IMPORTANT: Uses session default headers (no API_HEADERS) for 2FA POSTs.
         """
-        # The redirection from login tells us the 2FA path: /signin/two-factor
-        # Try multiple possible 2FA validation endpoints
+        # PUT /api/accounts/two_factor_authentication is the correct endpoint
+        # (confirmed: returns 200 with Doctolib Pro HTML page on success)
         strategies = [
-            # Based on the /signin/two-factor redirect path
-            ("POST", "/signin/two-factor.json", {"auth_code": code}),
-            ("POST", "/signin/two-factor", {"auth_code": code}),
-            ("POST", "/api/signin/two-factor", {"auth_code": code}),
-            # Old endpoints (might work on some Doctolib versions)
-            ("POST", "/api/accounts/two_factor_authentication", {"auth_code": code}),
             ("PUT", "/api/accounts/two_factor_authentication", {"auth_code": code}),
-            # With email method specified
-            ("POST", "/signin/two-factor.json", {
-                "auth_code": code,
-                "two_factor_auth_method": "email",
-            }),
+            ("POST", "/api/accounts/two_factor_authentication", {"auth_code": code}),
         ]
 
         all_attempts = []
@@ -233,6 +236,10 @@ class DoctolibClient:
                         if any(k in resp_data for k in ("doctor", "agendas", "id")):
                             self._account_data = resp_data
 
+                    # Extract CSRF token from HTML response (Rails apps need it)
+                    if resp_data is None and resp_text:
+                        self._extract_csrf_token(resp_text)
+
                     self._authenticated = True
                     self._requires_2fa = False
                     self._tfa_response = {"attempts": all_attempts}
@@ -261,6 +268,7 @@ class DoctolibClient:
         self._requires_2fa = False
         self._account_data = {}
         self._auth_token = None
+        self._csrf_token = None
         self._tfa_response = None
         self.session = cloudscraper.create_scraper()
         self.session.headers.update(self.BROWSER_HEADERS)
