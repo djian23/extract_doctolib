@@ -152,33 +152,42 @@ class DoctolibClient:
 
     def submit_2fa_code(self, code: str) -> dict[str, Any]:
         """Submit 2FA authentication code."""
-        try:
-            resp = self.session.post(
-                self._url("/login/challenge"),
-                json={
-                    "auth_code": code,
-                    "two_factor_auth_method": "email",
-                },
-            )
-        except Exception as e:
+        # Try multiple known Doctolib 2FA endpoints
+        endpoints = [
+            ("/api/accounts/two_factor_authentication", {"auth_code": code}),
+            ("/login.json", {
+                "kind": "doctor",
+                "username": self.email,
+                "password": self.password,
+                "auth_code": code,
+                "two_factor_auth_method": "email",
+            }),
+        ]
+
+        last_resp = None
+        for endpoint, payload in endpoints:
+            try:
+                resp = self.session.post(self._url(endpoint), json=payload)
+                last_resp = resp
+                logger.info(f"2FA attempt on {endpoint}: HTTP {resp.status_code}")
+                if resp.status_code < 400:
+                    break
+            except Exception as e:
+                logger.warning(f"2FA attempt on {endpoint} failed: {e}")
+                continue
+
+        if last_resp is None:
             return {
                 "success": False,
                 "requires_2fa": True,
-                "message": f"Erreur réseau: {e}",
+                "message": "Erreur réseau sur tous les endpoints 2FA.",
             }
 
-        if resp.status_code == 404:
+        if last_resp.status_code >= 400:
             return {
                 "success": False,
                 "requires_2fa": True,
-                "message": "Code 2FA invalide.",
-            }
-
-        if resp.status_code >= 400:
-            return {
-                "success": False,
-                "requires_2fa": True,
-                "message": f"Erreur HTTP {resp.status_code}.",
+                "message": f"Code 2FA invalide (HTTP {last_resp.status_code}).",
             }
 
         self._authenticated = True
