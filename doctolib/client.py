@@ -21,12 +21,17 @@ class DoctolibClient:
         ),
     }
 
+    # Login happens on pro.doctolib.fr, but API is on admin.doctolib.fr
+    API_BASE_URL = "https://admin.doctolib.fr"
+
     def __init__(self, base_url: str, email: str, password: str):
         self.base_url = base_url.rstrip("/")
+        self.api_base_url = self.API_BASE_URL
         self.email = email
         self.password = password
         self._authenticated = False
         self._requires_2fa = False
+        self._api_session_established = False
         self._account_data: dict[str, Any] = {}
 
         self.session = cloudscraper.create_scraper()
@@ -41,17 +46,22 @@ class DoctolibClient:
         return self._requires_2fa
 
     def _url(self, path: str) -> str:
+        """URL for auth endpoints (pro.doctolib.fr)."""
         return f"{self.base_url}{path}"
 
+    def _api_url(self, path: str) -> str:
+        """URL for data/API endpoints (admin.doctolib.fr)."""
+        return f"{self.api_base_url}{path}"
+
     def _get_json(self, path: str, params: Optional[dict] = None) -> dict[str, Any]:
-        """GET request returning JSON. Raises on HTTP error."""
-        resp = self.session.get(self._url(path), params=params)
+        """GET request on API domain returning JSON. Raises on HTTP error."""
+        resp = self.session.get(self._api_url(path), params=params)
         resp.raise_for_status()
         return resp.json()
 
     def _post_json(self, path: str, json_data: Optional[dict] = None) -> dict[str, Any]:
-        """POST request with JSON body, returning JSON. Raises on HTTP error."""
-        resp = self.session.post(self._url(path), json=json_data)
+        """POST request on API domain with JSON body, returning JSON."""
+        resp = self.session.post(self._api_url(path), json=json_data)
         resp.raise_for_status()
         return resp.json()
 
@@ -203,7 +213,10 @@ class DoctolibClient:
         self._authenticated = True
         self._requires_2fa = False
 
-        # Re-fetch full account data after successful 2FA
+        # Establish session on admin.doctolib.fr (the API domain)
+        self._establish_api_session()
+
+        # Re-fetch full account data from the API domain
         self._refresh_account_data()
 
         return {
@@ -212,28 +225,86 @@ class DoctolibClient:
             "message": "Authentification 2FA réussie.",
         }
 
+    def _establish_api_session(self) -> None:
+        """
+        After auth on pro.doctolib.fr, establish session on admin.doctolib.fr.
+        Doctolib redirects from pro → admin after login.
+        """
+        # Check if the 2FA/login response had a redirection hint
+        redirect_url = self._account_data.get("redirection", "")
+        if redirect_url and "admin.doctolib" in str(redirect_url):
+            target = str(redirect_url).rstrip("/")
+            if not target.startswith("http"):
+                target = f"https://{target}"
+            self.api_base_url = target
+            logger.info(f"API base URL set from redirection: {self.api_base_url}")
+
+        # Visit the admin domain to transfer/establish session cookies
+        try:
+            resp = self.session.get(self.api_base_url, allow_redirects=True)
+            logger.info(
+                f"Admin session init: HTTP {resp.status_code}, "
+                f"URL: {resp.url}, cookies: {list(self.session.cookies.keys())}"
+            )
+            self._api_session_established = resp.status_code < 400
+        except Exception as e:
+            logger.warning(f"Failed to establish admin session: {e}")
+
+        # Also try the login.json on admin domain to transfer auth
+        try:
+            login_payload = {
+                "kind": "doctor",
+                "username": self.email,
+                "password": self.password,
+                "remember": True,
+                "remember_username": True,
+            }
+            resp = self.session.post(
+                f"{self.api_base_url}/login.json",
+                json=login_payload,
+            )
+            logger.info(f"Admin login: HTTP {resp.status_code}")
+            if resp.status_code < 400:
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict) and "doctor" in data:
+                        self._account_data = data
+                        self._api_session_established = True
+                        logger.info(f"Account data from admin login, keys: {list(data.keys())[:10]}")
+                except ValueError:
+                    pass
+        except Exception as e:
+            logger.warning(f"Admin login attempt failed: {e}")
+
     def _refresh_account_data(self) -> None:
-        """Fetch full account data after authentication (post-2FA)."""
+        """Fetch full account data after authentication."""
+        # Try on the API domain (admin.doctolib.fr)
         account_endpoints = [
-            "/api/accounts/current.json",
-            "/account.json",
-            "/api/account.json",
+            (self.api_base_url, "/account.json"),
+            (self.api_base_url, "/api/account.json"),
+            (self.api_base_url, "/api/accounts/current.json"),
+            # Fallback to auth domain
+            (self.base_url, "/account.json"),
+            (self.base_url, "/api/accounts/current.json"),
         ]
-        for path in account_endpoints:
+        for base, path in account_endpoints:
             try:
-                resp = self.session.get(self._url(path))
-                logger.info(f"Account refresh {path}: HTTP {resp.status_code}")
+                url = f"{base}{path}"
+                resp = self.session.get(url)
+                logger.info(f"Account refresh {url}: HTTP {resp.status_code}")
                 if resp.status_code < 400:
                     data = resp.json()
                     if data and isinstance(data, dict):
-                        self._account_data = data
-                        logger.info(
-                            f"Account data refreshed from {path}, "
-                            f"keys: {list(data.keys())[:10]}"
-                        )
-                        return
+                        # Only update if it looks like real account data
+                        if any(k in data for k in ("doctor", "agendas", "id", "name")):
+                            self._account_data = data
+                            logger.info(
+                                f"Account data refreshed from {url}, "
+                                f"keys: {list(data.keys())[:10]}"
+                            )
+                            return
             except Exception as e:
-                logger.warning(f"Account refresh {path} failed: {e}")
+                logger.warning(f"Account refresh {base}{path} failed: {e}")
                 continue
         logger.warning("Could not refresh account data from any endpoint")
 
@@ -241,7 +312,9 @@ class DoctolibClient:
         """Reset session."""
         self._authenticated = False
         self._requires_2fa = False
+        self._api_session_established = False
         self._account_data = {}
+        self.api_base_url = self.API_BASE_URL
         self.session = cloudscraper.create_scraper()
         self.session.headers.update(self.DEFAULT_HEADERS)
 
@@ -301,46 +374,46 @@ class DoctolibClient:
         base_params = {"start_date": start_date, "end_date": end_date}
         params_with_agendas = {**base_params, **({"agenda_ids": agenda_ids} if agenda_ids else {})}
 
-        # Try multiple known Doctolib Pro endpoints
-        endpoints = [
+        api_paths = [
             ("/api/events.json", params_with_agendas),
             ("/events.json", params_with_agendas),
-            ("/api/calendar/events.json", params_with_agendas),
-            ("/calendar/events.json", base_params),
+            ("/api/appointments.json", params_with_agendas),
             ("/appointments.json", base_params),
-            ("/api/appointments.json", base_params),
         ]
 
         # If we have individual agenda IDs, also try per-agenda endpoints
         if agenda_ids:
             for aid in agenda_ids.split("-"):
-                endpoints.append((f"/api/agendas/{aid}/events.json", base_params))
+                api_paths.append((f"/api/agendas/{aid}/events.json", base_params))
+
+        # Build full URL list: try API domain first, then auth domain as fallback
+        endpoints: list[tuple[str, str, dict]] = []
+        for path, params in api_paths:
+            endpoints.append((self.api_base_url, path, params))
+        for path, params in api_paths:
+            endpoints.append((self.base_url, path, params))
 
         errors = []
-        for path, params in endpoints:
+        for base, path, params in endpoints:
             try:
-                resp = self.session.get(self._url(path), params=params)
+                url = f"{base}{path}"
+                resp = self.session.get(url, params=params)
                 status = resp.status_code
-                # Log response snippet for debugging
                 body_preview = resp.text[:200] if resp.text else "(empty)"
-                logger.info(
-                    f"Appointments {path}: HTTP {status} | "
-                    f"Body: {body_preview}"
-                )
+                logger.info(f"Appointments {url}: HTTP {status} | Body: {body_preview}")
                 if status < 400:
                     try:
                         data = resp.json()
-                        # Validate it looks like real data (not a login page)
                         if isinstance(data, (list, dict)):
                             return data
                     except ValueError:
-                        errors.append(f"{path}: HTTP {status} but invalid JSON")
+                        errors.append(f"{url}: HTTP {status} invalid JSON")
                         continue
                 else:
-                    errors.append(f"{path}: HTTP {status}")
+                    errors.append(f"{url}: HTTP {status}")
             except Exception as e:
-                errors.append(f"{path}: {e}")
-                logger.warning(f"Appointments attempt {path} failed: {e}")
+                errors.append(f"{base}{path}: {e}")
+                logger.warning(f"Appointments attempt {base}{path} failed: {e}")
                 continue
 
         error_details = "; ".join(errors)
@@ -351,37 +424,48 @@ class DoctolibClient:
 
     def get_appointment(self, appointment_id: int) -> dict[str, Any]:
         """Fetch details of a specific appointment."""
-        for path in [
+        paths = [
             f"/api/events/{appointment_id}.json",
+            f"/api/appointments/{appointment_id}.json",
             f"/appointments/{appointment_id}/edit.json",
             f"/appointments/{appointment_id}.json",
-        ]:
-            try:
-                resp = self.session.get(self._url(path))
-                if resp.status_code < 400:
-                    return resp.json()
-            except Exception:
-                continue
+        ]
+        for base in [self.api_base_url, self.base_url]:
+            for path in paths:
+                try:
+                    url = f"{base}{path}"
+                    resp = self.session.get(url)
+                    if resp.status_code < 400:
+                        return resp.json()
+                except Exception:
+                    continue
         raise RuntimeError(f"Rendez-vous {appointment_id} non trouvé.")
 
     # --- Patients ---
 
     def get_patients(self) -> Any:
         """Fetch master patients list."""
-        for path in [
+        paths = [
             "/api/patients.json",
             "/api/master_patients.json",
             "/account/master_patients.json",
-        ]:
-            try:
-                resp = self.session.get(self._url(path))
-                logger.info(f"Patients attempt {path}: HTTP {resp.status_code}")
-                if resp.status_code < 400:
-                    return resp.json()
-            except Exception as e:
-                logger.warning(f"Patients attempt {path} failed: {e}")
-                continue
-        raise RuntimeError("Aucun endpoint n'a fonctionné pour les patients.")
+        ]
+        errors = []
+        for base in [self.api_base_url, self.base_url]:
+            for path in paths:
+                try:
+                    url = f"{base}{path}"
+                    resp = self.session.get(url)
+                    logger.info(f"Patients {url}: HTTP {resp.status_code}")
+                    if resp.status_code < 400:
+                        return resp.json()
+                    else:
+                        errors.append(f"{url}: HTTP {resp.status_code}")
+                except Exception as e:
+                    errors.append(f"{base}{path}: {e}")
+                    logger.warning(f"Patients attempt {base}{path} failed: {e}")
+                    continue
+        raise RuntimeError(f"Aucun endpoint n'a fonctionné pour les patients. Détails: {'; '.join(errors)}")
 
     # --- Availabilities ---
 
