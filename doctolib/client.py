@@ -325,40 +325,57 @@ class DoctolibClient:
         """Submit 2FA authentication code.
 
         Flow:
-        1. PUT /api/accounts/two_factor_authentication with existing session + CSRF
+        1. PUT /api/accounts/two_factor_authentication on multiple domains
         2. Re-POST /login.json to complete authentication
         """
         all_attempts = []
 
-        # Step 1: Validate 2FA code via PUT (use existing session, no page visit)
+        # Debug: log current session cookies before attempting 2FA
+        session_cookies = []
+        for cookie in self.session.cookies.jar:
+            session_cookies.append({
+                "name": cookie.name,
+                "domain": cookie.domain,
+                "path": cookie.path,
+                "secure": cookie.secure,
+            })
+        all_attempts.append({
+            "step": "session_state",
+            "cookies": session_cookies,
+            "csrf_token": bool(self._csrf_token),
+        })
+
+        # Try multiple domains - doctoshotgun uses www.doctolib.fr
+        domains_to_try = [
+            self.base_url,                    # pro.doctolib.fr
+            "https://www.doctolib.fr",        # www (used by doctoshotgun)
+            "https://admin.doctolib.fr",      # admin (mentioned in 401 response)
+        ]
+
         endpoint = "/api/accounts/two_factor_authentication"
         tfa_validated = False
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"{self.base_url}/sessions/new",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-        }
-        if self._csrf_token:
-            headers["X-CSRF-Token"] = self._csrf_token
 
-        for method in ("PUT", "POST"):
+        for domain in domains_to_try:
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"{domain}/",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+            }
+            if self._csrf_token:
+                headers["X-CSRF-Token"] = self._csrf_token
+
+            url = f"{domain}{endpoint}"
             payload = {"auth_code": code}
             try:
-                if method == "PUT":
-                    resp = self.session.put(
-                        self._url(endpoint), json=payload,
-                        headers=headers, allow_redirects=False,
-                    )
-                else:
-                    resp = self.session.post(
-                        self._url(endpoint), json=payload,
-                        headers=headers, allow_redirects=False,
-                    )
-                logger.info(f"2FA {method} [{endpoint}]: HTTP {resp.status_code}")
+                resp = self.session.put(
+                    url, json=payload,
+                    headers=headers, allow_redirects=False,
+                )
+                logger.info(f"2FA PUT [{url}]: HTTP {resp.status_code}")
 
                 resp_data = None
                 try:
@@ -367,19 +384,20 @@ class DoctolibClient:
                     pass
 
                 attempt_info = {
-                    "method": method,
-                    "endpoint": endpoint,
+                    "domain": domain,
+                    "method": "PUT",
+                    "url": url,
                     "status": resp.status_code,
                     "data": resp_data,
                     "body_preview": resp.text[:300] if resp_data is None and resp.text else None,
                     "location": resp.headers.get("Location"),
                     "set_cookie_headers": [
                         v for k, v in resp.headers.items() if k.lower() == "set-cookie"
-                    ][:5],
+                    ][:3],
                 }
                 all_attempts.append(attempt_info)
 
-                # 2xx = code validated (302 to signin = NOT validated)
+                # 2xx = code validated
                 if resp.status_code in (200, 204):
                     tfa_validated = True
 
@@ -393,16 +411,8 @@ class DoctolibClient:
                             self._account_data = resp_data
                     break
 
-                # 302 to signin = session lost, try next method
-                if resp.status_code == 302:
-                    location = resp.headers.get("Location", "")
-                    if "signin" in location:
-                        logger.warning(f"2FA {method}: redirected to signin, session lost")
-                        continue
-
             except Exception as e:
-                all_attempts.append({"method": method, "endpoint": endpoint, "error": str(e)})
-                logger.warning(f"2FA {method} [{endpoint}] failed: {e}")
+                all_attempts.append({"domain": domain, "method": "PUT", "error": str(e)})
                 continue
 
         if not tfa_validated:
