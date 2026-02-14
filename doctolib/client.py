@@ -44,6 +44,7 @@ class DoctolibClient:
         self._requires_2fa = False
         self._account_data: dict[str, Any] = {}
         self._auth_token: Optional[str] = None
+        self._tfa_response: Optional[dict] = None  # Store 2FA response for debug
 
         self.session = cloudscraper.create_scraper()
         self.session.headers.update(self.BROWSER_HEADERS)
@@ -185,73 +186,86 @@ class DoctolibClient:
 
     def submit_2fa_code(self, code: str) -> dict[str, Any]:
         """Submit 2FA authentication code."""
-        # Strategy 1: Validate 2FA code via dedicated endpoint
-        tfa_resp_data = None
-        try:
-            resp = self.session.post(
-                self._url("/api/accounts/two_factor_authentication"),
-                json={"auth_code": code},
-                headers=self.API_HEADERS,
-            )
-            logger.info(f"2FA validation: HTTP {resp.status_code}")
-            logger.info(f"2FA response headers: {dict(resp.headers)}")
+        strategies = []
+
+        # Get the two_factor_auth_response if it was in the login data
+        tfa_challenge = self._account_data.get("two_factor_auth_response")
+
+        # Strategy 1: Combined login + 2FA code (full login in one shot)
+        combined_payload = {
+            "kind": "doctor",
+            "username": self.email,
+            "password": self.password,
+            "auth_code": code,
+            "two_factor_auth_method": "email",
+            "remember": True,
+            "remember_username": True,
+        }
+        if tfa_challenge:
+            combined_payload["two_factor_auth_response"] = tfa_challenge
+        strategies.append(("/login.json", combined_payload))
+
+        # Strategy 2: Dedicated 2FA endpoint
+        tfa_payload = {"auth_code": code}
+        if tfa_challenge:
+            tfa_payload["two_factor_auth_response"] = tfa_challenge
+        strategies.append(("/api/accounts/two_factor_authentication", tfa_payload))
+
+        # Strategy 3: Dedicated 2FA with email method specified
+        strategies.append(("/api/accounts/two_factor_authentication", {
+            "auth_code": code,
+            "two_factor_auth_method": "email",
+        }))
+
+        for endpoint, payload in strategies:
             try:
-                tfa_resp_data = resp.json()
-                logger.info(f"2FA response: {tfa_resp_data}")
-            except ValueError:
-                logger.info(f"2FA response body (non-JSON): {resp.text[:500]}")
+                resp = self.session.post(
+                    self._url(endpoint),
+                    json=payload,
+                    headers=self.API_HEADERS,
+                )
+                logger.info(f"2FA [{endpoint}]: HTTP {resp.status_code}")
 
-            if resp.status_code < 400:
-                # 2FA validated! Store any data from the response
-                if isinstance(tfa_resp_data, dict):
-                    self._extract_token(tfa_resp_data)
-                    # If response contains account data, use it
-                    if any(k in tfa_resp_data for k in ("doctor", "agendas", "id")):
-                        self._account_data = tfa_resp_data
-
-                self._authenticated = True
-                self._requires_2fa = False
-                return {
-                    "success": True,
-                    "requires_2fa": False,
-                    "message": "Authentification 2FA réussie.",
-                }
-        except Exception as e:
-            logger.warning(f"2FA validation failed: {e}")
-
-        # Strategy 2: Combined login + 2FA code in one call
-        try:
-            resp = self.session.post(
-                self._url("/login.json"),
-                json={
-                    "kind": "doctor",
-                    "username": self.email,
-                    "password": self.password,
-                    "auth_code": code,
-                    "two_factor_auth_method": "email",
-                    "remember": True,
-                    "remember_username": True,
-                },
-                headers=self.API_HEADERS,
-            )
-            logger.info(f"Combined login+2FA: HTTP {resp.status_code}")
-            if resp.status_code < 400:
+                resp_data = None
                 try:
-                    data = resp.json()
-                    self._account_data = data
-                    self._extract_token(data)
-                    logger.info(f"Combined login+2FA keys: {list(data.keys())}")
+                    resp_data = resp.json()
+                    logger.info(f"2FA [{endpoint}] response keys: {list(resp_data.keys()) if isinstance(resp_data, dict) else type(resp_data)}")
                 except ValueError:
-                    pass
-                self._authenticated = True
-                self._requires_2fa = False
-                return {
-                    "success": True,
-                    "requires_2fa": False,
-                    "message": "Authentification 2FA réussie.",
+                    logger.info(f"2FA [{endpoint}] non-JSON: {resp.text[:200]}")
+
+                # Store for debug
+                self._tfa_response = {
+                    "endpoint": endpoint,
+                    "status": resp.status_code,
+                    "data": resp_data,
+                    "headers": dict(resp.headers),
                 }
-        except Exception as e:
-            logger.warning(f"Combined login+2FA failed: {e}")
+
+                if resp.status_code < 400:
+                    if isinstance(resp_data, dict):
+                        self._extract_token(resp_data)
+                        # Check if this response has full account data
+                        if any(k in resp_data for k in ("doctor", "agendas", "id")):
+                            self._account_data = resp_data
+                            logger.info("Got full account data from 2FA response!")
+                        # Check if still asking for 2FA (not really authenticated)
+                        redir = resp_data.get("redirect") or resp_data.get("redirection")
+                        if redir and "two-factor" in str(redir):
+                            logger.warning(f"2FA [{endpoint}] still redirecting to 2FA: {redir}")
+                            continue
+
+                    self._authenticated = True
+                    self._requires_2fa = False
+                    return {
+                        "success": True,
+                        "requires_2fa": False,
+                        "message": f"Authentification 2FA réussie via {endpoint}.",
+                    }
+                else:
+                    logger.warning(f"2FA [{endpoint}]: HTTP {resp.status_code}")
+            except Exception as e:
+                logger.warning(f"2FA [{endpoint}] failed: {e}")
+                continue
 
         return {
             "success": False,
@@ -265,6 +279,7 @@ class DoctolibClient:
         self._requires_2fa = False
         self._account_data = {}
         self._auth_token = None
+        self._tfa_response = None
         self.session = cloudscraper.create_scraper()
         self.session.headers.update(self.BROWSER_HEADERS)
 
@@ -296,9 +311,32 @@ class DoctolibClient:
         """Test /api/appointments.json with multiple auth approaches."""
         url = self._url("/api/appointments.json")
         params = {"start_date": "2026-02-14", "end_date": "2026-02-15"}
+
+        # Show account data values (redact long/sensitive values)
+        account_summary = {}
+        for k, v in self._account_data.items():
+            if v is None:
+                account_summary[k] = None
+            elif isinstance(v, str):
+                if len(v) > 50:
+                    account_summary[k] = f"str({len(v)} chars): {v[:30]}..."
+                elif k in ("password",):
+                    account_summary[k] = "***"
+                else:
+                    account_summary[k] = v
+            elif isinstance(v, (int, float, bool)):
+                account_summary[k] = v
+            elif isinstance(v, list):
+                account_summary[k] = f"list({len(v)} items)"
+            elif isinstance(v, dict):
+                account_summary[k] = f"dict({list(v.keys())[:5]})"
+            else:
+                account_summary[k] = str(type(v))
+
         results = {
             "auth_token": f"{self._auth_token[:20]}..." if self._auth_token else None,
-            "account_keys": list(self._account_data.keys()),
+            "account_data": account_summary,
+            "tfa_response": self._tfa_response,
             "tests": [],
         }
 
