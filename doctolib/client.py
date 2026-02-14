@@ -1,4 +1,6 @@
+import json
 import logging
+import re
 import time
 from datetime import date, datetime
 from typing import Any, Optional
@@ -19,23 +21,6 @@ class DoctolibClient:
         "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
     }
 
-    # Headers for page navigation (login, sessions)
-    NAV_HEADERS = {
-        "sec-fetch-dest": "document",
-        "sec-fetch-mode": "navigate",
-        "sec-fetch-site": "same-origin",
-    }
-
-    # Headers for AJAX/API calls (appointments, patients, etc.)
-    API_HEADERS = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-    }
-
     def __init__(self, base_url: str, email: str, password: str):
         self.base_url = base_url.rstrip("/")
         self.email = email
@@ -45,7 +30,8 @@ class DoctolibClient:
         self._account_data: dict[str, Any] = {}
         self._auth_token: Optional[str] = None
         self._csrf_token: Optional[str] = None
-        self._tfa_response: Optional[dict] = None  # Store 2FA response for debug
+        self._admin_base_url: Optional[str] = None
+        self._session_debug: dict[str, Any] = {}
 
         self.session = cloudscraper.create_scraper()
         self.session.headers.update(self.BROWSER_HEADERS)
@@ -58,17 +44,45 @@ class DoctolibClient:
     def requires_2fa(self) -> bool:
         return self._requires_2fa
 
-    def _url(self, path: str) -> str:
-        return f"{self.base_url}{path}"
+    def _url(self, path: str, domain: Optional[str] = None) -> str:
+        base = domain or self.base_url
+        return f"{base}{path}"
 
-    def _api_get(self, path: str, params: Optional[dict] = None) -> Any:
-        """GET request with proper API/AJAX headers. Returns response object."""
-        headers = {**self.API_HEADERS}
-        if self._auth_token:
-            headers["Authorization"] = f"Bearer {self._auth_token}"
+    def _api_get(
+        self,
+        path: str,
+        params: Optional[dict] = None,
+        domain: Optional[str] = None,
+    ) -> Any:
+        """Simple GET with Accept: application/json + Referer + CSRF."""
+        url = self._url(path, domain=domain)
+        headers = {
+            "Accept": "application/json",
+            "Referer": f"{domain or self.base_url}/",
+        }
         if self._csrf_token:
             headers["X-CSRF-Token"] = self._csrf_token
-        return self.session.get(self._url(path), params=params, headers=headers)
+        return self.session.get(url, params=params, headers=headers)
+
+    def _api_get_ajax(
+        self,
+        path: str,
+        params: Optional[dict] = None,
+        domain: Optional[str] = None,
+    ) -> Any:
+        """AJAX-style GET with XMLHttpRequest header."""
+        url = self._url(path, domain=domain)
+        headers = {
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"{domain or self.base_url}/",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+        }
+        if self._csrf_token:
+            headers["X-CSRF-Token"] = self._csrf_token
+        return self.session.get(url, params=params, headers=headers)
 
     # --- Authentication ---
 
@@ -76,10 +90,7 @@ class DoctolibClient:
         """
         Authenticate with Doctolib Pro.
 
-        Returns a dict with keys:
-          - success: bool
-          - requires_2fa: bool
-          - message: str
+        Returns a dict with keys: success, requires_2fa, message
         """
         # Step 1: Initialize session (get cookies, CSRF token)
         try:
@@ -90,6 +101,8 @@ class DoctolibClient:
                     "requires_2fa": False,
                     "message": "Bloqué par Cloudflare. Réessayez plus tard.",
                 }
+            if resp.status_code == 200:
+                self._extract_csrf_token(resp.text)
         except Exception as e:
             return {
                 "success": False,
@@ -140,22 +153,19 @@ class DoctolibClient:
 
         self._account_data = data
         logger.info(f"Login response keys: {list(data.keys())}")
-
-        # Extract auth token if present
         self._extract_token(data)
 
         # Step 3: Check if 2FA is required
         redirect = data.get("redirect") or data.get("redirection")
         if redirect and "two-factor" in str(redirect):
             self._requires_2fa = True
-            # Send 2FA code via email
             try:
                 self.session.post(
                     self._url("/api/accounts/send_auth_code"),
                     json={"two_factor_auth_method": "email"},
                 )
             except Exception:
-                pass  # Code may already be sent
+                pass
             return {
                 "success": False,
                 "requires_2fa": True,
@@ -164,10 +174,12 @@ class DoctolibClient:
 
         # No 2FA needed - login complete
         self._authenticated = True
+        session_debug = self._complete_session()
         return {
             "success": True,
             "requires_2fa": False,
             "message": "Connecté avec succès à Doctolib Pro.",
+            "debug": {"session_setup": session_debug},
         }
 
     def _extract_token(self, data: dict) -> None:
@@ -181,21 +193,53 @@ class DoctolibClient:
 
     def _extract_csrf_token(self, html: str) -> None:
         """Extract CSRF token from HTML meta tag (Rails convention)."""
-        import re
         match = re.search(r'name="csrf-token"\s+content="([^"]+)"', html)
+        if not match:
+            match = re.search(r'content="([^"]+)"\s+name="csrf-token"', html)
         if match:
             self._csrf_token = match.group(1)
             logger.info(f"CSRF token extracted ({len(self._csrf_token)} chars)")
-        else:
-            self._csrf_token = None
+
+    def _extract_embedded_data(self, html: str) -> dict[str, Any]:
+        """Extract embedded JSON data from HTML page (Rails/React/SPA apps)."""
+        data = {}
+
+        # Common patterns for embedded data
+        patterns = [
+            (r"window\.__INITIAL_STATE__\s*=\s*({.+?})\s*;", "initial_state"),
+            (r"window\.__DATA__\s*=\s*({.+?})\s*;", "window_data"),
+            (r"window\.currentUser\s*=\s*({.+?})\s*;", "current_user"),
+            (r'data-props="([^"]+)"', "data_props"),
+            (r"data-props='([^']+)'", "data_props_sq"),
+            (r'data-react-props="([^"]+)"', "react_props"),
+        ]
+
+        for pattern, key in patterns:
+            match = re.search(pattern, html, re.DOTALL)
+            if match:
+                raw = match.group(1)
+                # Unescape HTML entities
+                raw = (
+                    raw.replace("&quot;", '"')
+                    .replace("&amp;", "&")
+                    .replace("&#39;", "'")
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                )
+                try:
+                    parsed = json.loads(raw)
+                    data[key] = parsed
+                except (json.JSONDecodeError, ValueError):
+                    data[key + "_raw"] = raw[:200]
+
+        return data
 
     def submit_2fa_code(self, code: str) -> dict[str, Any]:
         """Submit 2FA authentication code.
 
-        IMPORTANT: Uses session default headers (no API_HEADERS) for 2FA POSTs.
+        Uses PUT /api/accounts/two_factor_authentication (confirmed working).
+        Falls back to POST if PUT fails.
         """
-        # PUT /api/accounts/two_factor_authentication is the correct endpoint
-        # (confirmed: returns 200 with Doctolib Pro HTML page on success)
         strategies = [
             ("PUT", "/api/accounts/two_factor_authentication", {"auth_code": code}),
             ("POST", "/api/accounts/two_factor_authentication", {"auth_code": code}),
@@ -211,56 +255,195 @@ class DoctolibClient:
                 logger.info(f"2FA {method} [{endpoint}]: HTTP {resp.status_code}")
 
                 resp_data = None
-                resp_text = resp.text[:300] if resp.text else ""
+                resp_text = resp.text[:500] if resp.text else ""
                 try:
                     resp_data = resp.json()
                 except ValueError:
                     pass
 
-                all_attempts.append({
+                attempt_info = {
                     "method": method,
                     "endpoint": endpoint,
                     "status": resp.status_code,
                     "data": resp_data,
-                    "body_preview": resp_text if resp_data is None else None,
-                })
+                    "body_preview": resp_text[:300] if resp_data is None else None,
+                    "set_cookie_headers": [
+                        v for k, v in resp.headers.items() if k.lower() == "set-cookie"
+                    ][:5],
+                }
+                all_attempts.append(attempt_info)
 
                 if resp.status_code < 400:
-                    # Check if still redirecting to 2FA (= not really authenticated)
+                    # Check for 2FA redirect loop
                     if isinstance(resp_data, dict):
                         redir = resp_data.get("redirect") or resp_data.get("redirection")
                         if redir and "two-factor" in str(redir):
-                            logger.info(f"2FA [{endpoint}]: still needs 2FA (redirection={redir})")
+                            logger.info(f"2FA [{endpoint}]: still redirecting to 2FA")
                             continue
                         self._extract_token(resp_data)
                         if any(k in resp_data for k in ("doctor", "agendas", "id")):
                             self._account_data = resp_data
 
-                    # Extract CSRF token from HTML response (Rails apps need it)
-                    if resp_data is None and resp_text:
-                        self._extract_csrf_token(resp_text)
+                    # Extract CSRF from HTML response
+                    if resp_data is None and resp.text:
+                        self._extract_csrf_token(resp.text)
 
                     self._authenticated = True
                     self._requires_2fa = False
-                    self._tfa_response = {"attempts": all_attempts}
+
+                    # Complete session setup
+                    session_debug = self._complete_session()
+
                     return {
                         "success": True,
                         "requires_2fa": False,
                         "message": f"2FA réussie via {method} {endpoint}.",
-                        "debug": all_attempts,
+                        "debug": {
+                            "attempts": all_attempts,
+                            "session_setup": session_debug,
+                        },
                     }
             except Exception as e:
                 all_attempts.append({"endpoint": endpoint, "error": str(e)})
                 logger.warning(f"2FA [{endpoint}] failed: {e}")
                 continue
 
-        self._tfa_response = {"attempts": all_attempts}
         return {
             "success": False,
             "requires_2fa": True,
             "message": "Code 2FA invalide.",
             "debug": all_attempts,
         }
+
+    def _complete_session(self) -> dict[str, Any]:
+        """Complete session setup after authentication.
+
+        After login/2FA, navigates to the dashboard to:
+        1. Get additional session cookies
+        2. Extract embedded data (account info, agendas)
+        3. Get CSRF token
+        4. Test if admin.doctolib.fr is accessible
+        """
+        debug: dict[str, Any] = {"steps": []}
+
+        # Step 1: Visit dashboard page to complete session
+        try:
+            resp = self.session.get(self._url("/"))
+            ct = resp.headers.get("content-type", "")
+            debug["steps"].append({
+                "action": "GET /",
+                "status": resp.status_code,
+                "content_type": ct,
+            })
+
+            if resp.status_code == 200 and "text/html" in ct:
+                self._extract_csrf_token(resp.text)
+                embedded = self._extract_embedded_data(resp.text)
+                if embedded:
+                    debug["embedded_keys"] = list(embedded.keys())
+                    for key in ("initial_state", "window_data", "current_user"):
+                        if key in embedded and isinstance(embedded[key], dict):
+                            ed = embedded[key]
+                            if "doctor" in ed or "agendas" in ed:
+                                self._account_data = ed
+                                debug["account_from"] = f"embedded.{key}"
+                                break
+        except Exception as e:
+            debug["steps"].append({"action": "GET /", "error": str(e)})
+
+        # Step 2: Try to get account data via JSON endpoints
+        for path in ["/account.json", "/api/account.json", "/api/accounts.json"]:
+            try:
+                resp = self._api_get(path)
+                body_preview = resp.text[:200] if resp.text else ""
+                debug["steps"].append({
+                    "action": f"GET {path}",
+                    "status": resp.status_code,
+                    "body_preview": body_preview,
+                })
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                        if isinstance(data, dict) and data:
+                            self._account_data = data
+                            debug["account_from"] = path
+                            break
+                    except ValueError:
+                        pass
+            except Exception as e:
+                debug["steps"].append({"action": f"GET {path}", "error": str(e)})
+
+        # Step 3: Test admin.doctolib.fr accessibility
+        self._admin_base_url = None
+        try:
+            resp = self.session.get("https://admin.doctolib.fr/")
+            ct = resp.headers.get("content-type", "")
+            is_cloudflare = False
+            if "text/html" in ct and resp.text:
+                lower_text = resp.text[:2000].lower()
+                is_cloudflare = any(
+                    kw in lower_text
+                    for kw in ("cloudflare", "cf-access", "access denied", "sign in")
+                )
+
+            debug["steps"].append({
+                "action": "GET admin.doctolib.fr/",
+                "status": resp.status_code,
+                "content_type": ct,
+                "cloudflare_blocked": is_cloudflare,
+                "body_preview": resp.text[:400] if resp.text else "",
+            })
+
+            if resp.status_code == 200 and not is_cloudflare:
+                self._admin_base_url = "https://admin.doctolib.fr"
+                debug["admin_accessible"] = True
+
+                # Try an API endpoint on admin
+                try:
+                    resp2 = self._api_get(
+                        "/api/appointments.json",
+                        params={"start_date": "2026-02-14", "end_date": "2026-02-15"},
+                        domain="https://admin.doctolib.fr",
+                    )
+                    debug["steps"].append({
+                        "action": "GET admin /api/appointments.json",
+                        "status": resp2.status_code,
+                        "body_preview": resp2.text[:300] if resp2.text else "",
+                    })
+                except Exception as e:
+                    debug["steps"].append({
+                        "action": "GET admin /api/appointments.json",
+                        "error": str(e),
+                    })
+            else:
+                debug["admin_accessible"] = False
+        except Exception as e:
+            debug["steps"].append({
+                "action": "GET admin.doctolib.fr/",
+                "error": str(e),
+            })
+            debug["admin_accessible"] = False
+
+        # Step 4: Record session state
+        debug["cookies"] = {}
+        for cookie in self.session.cookies:
+            domain = cookie.domain
+            if domain not in debug["cookies"]:
+                debug["cookies"][domain] = []
+            debug["cookies"][domain].append({
+                "name": cookie.name,
+                "path": cookie.path,
+                "secure": cookie.secure,
+            })
+
+        debug["csrf_token"] = f"{self._csrf_token[:20]}..." if self._csrf_token else None
+        debug["auth_token"] = bool(self._auth_token)
+        debug["account_keys"] = (
+            list(self._account_data.keys())[:15] if self._account_data else []
+        )
+
+        self._session_debug = debug
+        return debug
 
     def logout(self) -> None:
         """Reset session."""
@@ -269,7 +452,8 @@ class DoctolibClient:
         self._account_data = {}
         self._auth_token = None
         self._csrf_token = None
-        self._tfa_response = None
+        self._admin_base_url = None
+        self._session_debug = {}
         self.session = cloudscraper.create_scraper()
         self.session.headers.update(self.BROWSER_HEADERS)
 
@@ -277,14 +461,13 @@ class DoctolibClient:
         """Extract agenda IDs from account data, searching multiple structures."""
         agendas = []
 
-        # Try "doctor.agendas" (login response structure)
         doctor = self._account_data.get("doctor", {})
-        for agenda in doctor.get("agendas", []):
-            aid = agenda.get("id")
-            if aid:
-                agendas.append(str(aid))
+        if isinstance(doctor, dict):
+            for agenda in doctor.get("agendas", []):
+                aid = agenda.get("id")
+                if aid:
+                    agendas.append(str(aid))
 
-        # Try top-level "agendas"
         if not agendas:
             for agenda in self._account_data.get("agendas", []):
                 aid = agenda.get("id")
@@ -292,119 +475,105 @@ class DoctolibClient:
                     agendas.append(str(aid))
 
         result = "-".join(agendas)
-        logger.info(f"Agenda IDs: '{result}' (account keys: {list(self._account_data.keys())[:10]})")
+        logger.info(
+            f"Agenda IDs: '{result}' (account keys: {list(self._account_data.keys())[:10]})"
+        )
         return result
 
     # --- Debug ---
 
     def debug_api_test(self) -> dict[str, Any]:
-        """Test /api/appointments.json with multiple auth approaches."""
-        url = self._url("/api/appointments.json")
+        """Comprehensive API test with multiple auth approaches and domains."""
         params = {"start_date": "2026-02-14", "end_date": "2026-02-15"}
 
-        # Show account data values (redact long/sensitive values)
-        account_summary = {}
-        for k, v in self._account_data.items():
-            if v is None:
-                account_summary[k] = None
-            elif isinstance(v, str):
-                if len(v) > 50:
-                    account_summary[k] = f"str({len(v)} chars): {v[:30]}..."
-                elif k in ("password",):
-                    account_summary[k] = "***"
-                else:
-                    account_summary[k] = v
-            elif isinstance(v, (int, float, bool)):
-                account_summary[k] = v
-            elif isinstance(v, list):
-                account_summary[k] = f"list({len(v)} items)"
-            elif isinstance(v, dict):
-                account_summary[k] = f"dict({list(v.keys())[:5]})"
-            else:
-                account_summary[k] = str(type(v))
-
-        results = {
+        results: dict[str, Any] = {
+            "csrf_token": f"{self._csrf_token[:20]}..." if self._csrf_token else None,
             "auth_token": f"{self._auth_token[:20]}..." if self._auth_token else None,
-            "account_data": account_summary,
-            "tfa_response": self._tfa_response,
+            "admin_base_url": self._admin_base_url,
+            "account_keys": list(self._account_data.keys())[:15],
+            "agenda_ids": self._get_agenda_ids(),
+            "session_setup": self._session_debug,
             "tests": [],
         }
 
-        # Test 1: Session cookies only (no special headers)
-        try:
-            resp = self.session.get(url, params=params)
-            results["tests"].append({
-                "name": "cookies_only",
-                "status": resp.status_code,
-                "body": resp.text[:300],
-            })
-        except Exception as e:
-            results["tests"].append({"name": "cookies_only", "error": str(e)})
+        # Build test configurations: (name, path, domain, method)
+        test_configs = [
+            # Pro.doctolib.fr - simple headers (Accept + Referer)
+            ("pro_simple", "/api/appointments.json", None, "simple"),
+            # Pro.doctolib.fr - AJAX headers (+ X-Requested-With)
+            ("pro_ajax", "/api/appointments.json", None, "ajax"),
+            # Pro.doctolib.fr - cookies only (no custom headers)
+            ("pro_cookies_only", "/api/appointments.json", None, "cookies"),
+            # Different endpoint paths on pro
+            ("pro_events", "/api/events.json", None, "simple"),
+            ("pro_calendar", "/calendar.json", None, "simple"),
+            # HTML page scraping
+            ("pro_html_appointments", "/appointments", None, "html"),
+        ]
 
-        # Test 2: With AJAX headers
-        try:
-            resp = self.session.get(url, params=params, headers=self.API_HEADERS)
-            results["tests"].append({
-                "name": "ajax_headers",
-                "status": resp.status_code,
-                "body": resp.text[:300],
-            })
-        except Exception as e:
-            results["tests"].append({"name": "ajax_headers", "error": str(e)})
+        # Admin.doctolib.fr tests (if accessible after 2FA)
+        if self._admin_base_url:
+            test_configs.extend([
+                ("admin_simple", "/api/appointments.json", self._admin_base_url, "simple"),
+                ("admin_ajax", "/api/appointments.json", self._admin_base_url, "ajax"),
+                ("admin_events", "/api/events.json", self._admin_base_url, "simple"),
+                ("admin_root", "/", self._admin_base_url, "html"),
+            ])
+        else:
+            # Force-test admin even if not marked accessible
+            test_configs.extend([
+                ("admin_forced", "/api/appointments.json", "https://admin.doctolib.fr", "simple"),
+                ("admin_forced_cookies", "/api/appointments.json", "https://admin.doctolib.fr", "cookies"),
+            ])
 
-        # Test 3: With Bearer token
-        if self._auth_token:
+        for name, path, domain, method in test_configs:
             try:
-                headers = {
-                    **self.API_HEADERS,
-                    "Authorization": f"Bearer {self._auth_token}",
-                }
-                resp = self.session.get(url, params=params, headers=headers)
-                results["tests"].append({
-                    "name": "bearer_token",
+                if method == "simple":
+                    resp = self._api_get(path, params=params, domain=domain)
+                elif method == "ajax":
+                    resp = self._api_get_ajax(path, params=params, domain=domain)
+                elif method == "cookies":
+                    url = self._url(path, domain=domain)
+                    resp = self.session.get(url, params=params)
+                elif method == "html":
+                    url = self._url(path, domain=domain)
+                    resp = self.session.get(url, params=params)
+
+                ct = resp.headers.get("content-type", "")
+                body = resp.text[:500] if resp.text else ""
+
+                test_result: dict[str, Any] = {
+                    "name": name,
+                    "url": self._url(path, domain=domain),
+                    "method": method,
                     "status": resp.status_code,
-                    "body": resp.text[:300],
-                })
-            except Exception as e:
-                results["tests"].append({"name": "bearer_token", "error": str(e)})
-
-        # Test 4: Try www.doctolib.fr instead of pro.doctolib.fr
-        www_url = url.replace("pro.doctolib.fr", "www.doctolib.fr")
-        try:
-            resp = self.session.get(www_url, params=params, headers=self.API_HEADERS)
-            results["tests"].append({
-                "name": "www_domain",
-                "url": www_url,
-                "status": resp.status_code,
-                "body": resp.text[:300],
-            })
-        except Exception as e:
-            results["tests"].append({"name": "www_domain", "error": str(e)})
-
-        # Test 5: Try /api/appointments on www with Bearer
-        if self._auth_token:
-            try:
-                headers = {
-                    **self.API_HEADERS,
-                    "Authorization": f"Bearer {self._auth_token}",
+                    "content_type": ct,
+                    "body": body,
                 }
-                resp = self.session.get(www_url, params=params, headers=headers)
-                results["tests"].append({
-                    "name": "www_bearer",
-                    "url": www_url,
-                    "status": resp.status_code,
-                    "body": resp.text[:300],
-                })
-            except Exception as e:
-                results["tests"].append({"name": "www_bearer", "error": str(e)})
 
-        # Show cookies per domain
+                # If HTML, check for embedded data
+                if "text/html" in ct and resp.status_code == 200:
+                    embedded = self._extract_embedded_data(resp.text)
+                    if embedded:
+                        test_result["embedded_keys"] = list(embedded.keys())
+
+                results["tests"].append(test_result)
+            except Exception as e:
+                results["tests"].append({"name": name, "error": str(e)})
+
+        # Show all cookies with domain details
         results["cookies"] = {}
         for cookie in self.session.cookies:
             domain = cookie.domain
             if domain not in results["cookies"]:
                 results["cookies"][domain] = []
-            results["cookies"][domain].append(cookie.name)
+            results["cookies"][domain].append({
+                "name": cookie.name,
+                "path": cookie.path,
+                "secure": cookie.secure,
+                "domain_specified": cookie.domain_specified,
+                "domain_initial_dot": cookie.domain_initial_dot,
+            })
 
         return results
 
@@ -415,7 +584,7 @@ class DoctolibClient:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
     ) -> Any:
-        """Fetch appointments list."""
+        """Fetch appointments list, trying multiple endpoints and domains."""
         from datetime import timedelta
 
         if not start_date:
@@ -425,88 +594,151 @@ class DoctolibClient:
 
         agenda_ids = self._get_agenda_ids()
         base_params = {"start_date": start_date, "end_date": end_date}
-        params_with_agendas = {**base_params, **({"agenda_ids": agenda_ids} if agenda_ids else {})}
+        params_with_agendas = {
+            **base_params,
+            **({"agenda_ids": agenda_ids} if agenda_ids else {}),
+        }
 
-        endpoints = [
-            ("/api/appointments.json", params_with_agendas),
-            ("/api/events.json", params_with_agendas),
-            ("/events.json", params_with_agendas),
-            ("/appointments.json", base_params),
-        ]
+        # Build (path, params, domain, method) attempts
+        attempts: list[tuple[str, dict, Optional[str], str]] = []
 
+        # Pro.doctolib.fr with different headers
+        for path in ["/api/appointments.json", "/api/events.json", "/events.json", "/appointments.json"]:
+            attempts.append((path, params_with_agendas, None, "simple"))
+            attempts.append((path, params_with_agendas, None, "ajax"))
+            attempts.append((path, params_with_agendas, None, "cookies"))
+
+        # Admin.doctolib.fr (if accessible)
+        if self._admin_base_url:
+            for path in ["/api/appointments.json", "/api/events.json", "/appointments.json"]:
+                attempts.append((path, params_with_agendas, self._admin_base_url, "simple"))
+                attempts.append((path, params_with_agendas, self._admin_base_url, "ajax"))
+
+        # Per-agenda endpoints
         if agenda_ids:
             for aid in agenda_ids.split("-"):
-                endpoints.append((f"/api/agendas/{aid}/events.json", base_params))
+                attempts.append(
+                    (f"/api/agendas/{aid}/events.json", base_params, None, "simple")
+                )
+
+        # Different endpoint paths
+        attempts.append(("/calendar.json", params_with_agendas, None, "simple"))
+
+        # HTML page scraping as last resort
+        attempts.append(("/appointments", base_params, None, "html"))
 
         errors = []
-        for path, params in endpoints:
+        for path, params, domain, method in attempts:
             try:
-                resp = self._api_get(path, params=params)
+                domain_label = domain or self.base_url
+
+                if method == "simple":
+                    resp = self._api_get(path, params=params, domain=domain)
+                elif method == "ajax":
+                    resp = self._api_get_ajax(path, params=params, domain=domain)
+                elif method == "cookies":
+                    url = self._url(path, domain=domain)
+                    resp = self.session.get(url, params=params)
+                elif method == "html":
+                    url = self._url(path, domain=domain)
+                    resp = self.session.get(url, params=params)
+                    if resp.status_code == 200 and "text/html" in resp.headers.get(
+                        "content-type", ""
+                    ):
+                        embedded = self._extract_embedded_data(resp.text)
+                        if embedded:
+                            return {"source": "html_embedded", "data": embedded}
+                    errors.append(f"{path}@{domain_label}: HTML scrape - no data")
+                    continue
+
                 status = resp.status_code
-                body_preview = resp.text[:200] if resp.text else "(empty)"
-                logger.info(f"Appointments {path}: HTTP {status} | Body: {body_preview}")
                 if status < 400:
                     ct = resp.headers.get("content-type", "")
                     if "html" in ct and "json" not in ct:
-                        errors.append(f"{path}: HTTP {status} but HTML")
+                        errors.append(
+                            f"{path}@{domain_label}[{method}]: HTTP {status} but HTML"
+                        )
                         continue
                     try:
                         data = resp.json()
                         if isinstance(data, (list, dict)):
                             return data
                     except ValueError:
-                        errors.append(f"{path}: HTTP {status} invalid JSON")
+                        errors.append(
+                            f"{path}@{domain_label}[{method}]: HTTP {status} invalid JSON"
+                        )
                         continue
                 else:
-                    errors.append(f"{path}: HTTP {status}")
+                    errors.append(f"{path}@{domain_label}[{method}]: HTTP {status}")
             except Exception as e:
                 errors.append(f"{path}: {e}")
                 continue
 
         raise RuntimeError(
-            f"Aucun endpoint n'a fonctionné. "
-            f"Agenda IDs: '{agenda_ids}'. Détails: {'; '.join(errors)}"
+            f"Aucun endpoint n'a fonctionné pour les rendez-vous. "
+            f"Agenda IDs: '{agenda_ids}'. "
+            f"Admin accessible: {bool(self._admin_base_url)}. "
+            f"Détails: {'; '.join(errors[:10])}"
         )
 
     def get_appointment(self, appointment_id: int) -> dict[str, Any]:
         """Fetch details of a specific appointment."""
-        for path in [
-            f"/api/appointments/{appointment_id}.json",
-            f"/api/events/{appointment_id}.json",
-            f"/appointments/{appointment_id}.json",
-        ]:
-            try:
-                resp = self._api_get(path)
-                if resp.status_code < 400:
-                    return resp.json()
-            except Exception:
-                continue
+        domains = [None]
+        if self._admin_base_url:
+            domains.append(self._admin_base_url)
+
+        for domain in domains:
+            for path in [
+                f"/api/appointments/{appointment_id}.json",
+                f"/api/events/{appointment_id}.json",
+                f"/appointments/{appointment_id}.json",
+            ]:
+                try:
+                    resp = self._api_get(path, domain=domain)
+                    if resp.status_code < 400:
+                        ct = resp.headers.get("content-type", "")
+                        if "json" in ct:
+                            return resp.json()
+                except Exception:
+                    continue
         raise RuntimeError(f"Rendez-vous {appointment_id} non trouvé.")
 
     # --- Patients ---
 
     def get_patients(self) -> Any:
         """Fetch master patients list."""
+        domains = [None]
+        if self._admin_base_url:
+            domains.append(self._admin_base_url)
+
         errors = []
-        for path in [
-            "/api/patients.json",
-            "/api/master_patients.json",
-            "/account/master_patients.json",
-        ]:
-            try:
-                resp = self._api_get(path)
-                logger.info(f"Patients {path}: HTTP {resp.status_code}")
-                if resp.status_code < 400:
-                    ct = resp.headers.get("content-type", "")
-                    if "html" in ct and "json" not in ct:
-                        errors.append(f"{path}: HTTP {resp.status_code} but HTML")
-                        continue
-                    return resp.json()
-                else:
-                    errors.append(f"{path}: HTTP {resp.status_code}")
-            except Exception as e:
-                errors.append(f"{path}: {e}")
-                continue
+        for domain in domains:
+            for path in [
+                "/api/patients.json",
+                "/api/master_patients.json",
+                "/account/master_patients.json",
+            ]:
+                try:
+                    domain_label = domain or self.base_url
+                    resp = self._api_get(path, domain=domain)
+                    logger.info(
+                        f"Patients {path}@{domain_label}: HTTP {resp.status_code}"
+                    )
+                    if resp.status_code < 400:
+                        ct = resp.headers.get("content-type", "")
+                        if "html" in ct and "json" not in ct:
+                            errors.append(
+                                f"{path}@{domain_label}: HTTP {resp.status_code} but HTML"
+                            )
+                            continue
+                        return resp.json()
+                    else:
+                        errors.append(
+                            f"{path}@{domain_label}: HTTP {resp.status_code}"
+                        )
+                except Exception as e:
+                    errors.append(f"{path}: {e}")
+                    continue
         raise RuntimeError(f"Aucun endpoint patients. Détails: {'; '.join(errors)}")
 
     # --- Availabilities ---
@@ -532,6 +764,18 @@ class DoctolibClient:
             "destroy_temporary": "true",
             "limit": limit,
         }
+
+        domains = [None]
+        if self._admin_base_url:
+            domains.append(self._admin_base_url)
+
+        for domain in domains:
+            try:
+                resp = self._api_get("/availabilities.json", params=params, domain=domain)
+                if resp.status_code < 400:
+                    return resp.json()
+            except Exception:
+                continue
 
         resp = self._api_get("/availabilities.json", params=params)
         resp.raise_for_status()
