@@ -180,44 +180,55 @@ class DoctolibClient:
         """Submit 2FA authentication code.
 
         IMPORTANT: Uses session default headers (no API_HEADERS) for 2FA POSTs.
-        Adding X-Requested-With or sec-fetch-mode: cors breaks the 2FA endpoint.
         """
-        # Strategy 1: Dedicated 2FA endpoint (preserves existing session)
-        # Strategy 2: Combined login + 2FA (as fallback only - replaces session)
+        # The redirection from login tells us the 2FA path: /signin/two-factor
+        # Try multiple possible 2FA validation endpoints
         strategies = [
-            ("/api/accounts/two_factor_authentication", {"auth_code": code}),
-            ("/login.json", {
-                "kind": "doctor",
-                "username": self.email,
-                "password": self.password,
+            # Based on the /signin/two-factor redirect path
+            ("POST", "/signin/two-factor.json", {"auth_code": code}),
+            ("POST", "/signin/two-factor", {"auth_code": code}),
+            ("POST", "/api/signin/two-factor", {"auth_code": code}),
+            # Old endpoints (might work on some Doctolib versions)
+            ("POST", "/api/accounts/two_factor_authentication", {"auth_code": code}),
+            ("PUT", "/api/accounts/two_factor_authentication", {"auth_code": code}),
+            # With email method specified
+            ("POST", "/signin/two-factor.json", {
                 "auth_code": code,
                 "two_factor_auth_method": "email",
             }),
         ]
 
         all_attempts = []
-        for endpoint, payload in strategies:
+        for method, endpoint, payload in strategies:
             try:
-                # NO API_HEADERS here - use session defaults only
-                resp = self.session.post(self._url(endpoint), json=payload)
-                logger.info(f"2FA [{endpoint}]: HTTP {resp.status_code}")
+                if method == "PUT":
+                    resp = self.session.put(self._url(endpoint), json=payload)
+                else:
+                    resp = self.session.post(self._url(endpoint), json=payload)
+                logger.info(f"2FA {method} [{endpoint}]: HTTP {resp.status_code}")
 
                 resp_data = None
+                resp_text = resp.text[:300] if resp.text else ""
                 try:
                     resp_data = resp.json()
-                    logger.info(f"2FA [{endpoint}] response: {resp_data}")
                 except ValueError:
                     pass
 
                 all_attempts.append({
+                    "method": method,
                     "endpoint": endpoint,
                     "status": resp.status_code,
                     "data": resp_data,
+                    "body_preview": resp_text if resp_data is None else None,
                 })
 
                 if resp.status_code < 400:
-                    # Store any account data from response
+                    # Check if still redirecting to 2FA (= not really authenticated)
                     if isinstance(resp_data, dict):
+                        redir = resp_data.get("redirect") or resp_data.get("redirection")
+                        if redir and "two-factor" in str(redir):
+                            logger.info(f"2FA [{endpoint}]: still needs 2FA (redirection={redir})")
+                            continue
                         self._extract_token(resp_data)
                         if any(k in resp_data for k in ("doctor", "agendas", "id")):
                             self._account_data = resp_data
@@ -228,7 +239,7 @@ class DoctolibClient:
                     return {
                         "success": True,
                         "requires_2fa": False,
-                        "message": f"2FA réussie via {endpoint}.",
+                        "message": f"2FA réussie via {method} {endpoint}.",
                         "debug": all_attempts,
                     }
             except Exception as e:
