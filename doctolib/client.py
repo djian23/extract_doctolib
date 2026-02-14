@@ -427,14 +427,14 @@ class DoctolibClient:
     def submit_2fa_code(self, code: str) -> dict[str, Any]:
         """Submit 2FA code using cascading fallback strategies.
 
-        A. Restore login cookies + PUT auth_code
-        B. PUT with two_factor_auth_response from login
+        E. PUT with Authorization: Bearer refresh_token
+        F. PUT on www.doctolib.fr (session cookies exist for that domain)
+        G. PUT on admin.doctolib.fr (the redirect target from 401)
         C. POST /login.json with credentials + auth_code
-        D. Fresh login → immediate PUT (zero intermediate requests)
+        D. Fresh login → immediate PUT with Bearer token
         """
         all_attempts = []
         endpoint = "/api/accounts/two_factor_authentication"
-        url = self._url(endpoint)
 
         # Debug: initial state
         session_cookies = []
@@ -448,111 +448,159 @@ class DoctolibClient:
             "step": "initial_state",
             "cookies": session_cookies,
             "csrf_token": bool(self._csrf_token),
-            "login_cookies_saved": len(self._login_cookies_snapshot),
-            "two_factor_auth_data_keys": list(self._two_factor_auth_data.keys()),
+            "auth_token": self._auth_token[:20] + "..." if self._auth_token else None,
+            "two_factor_auth_data": self._two_factor_auth_data,
         })
-
-        # Common headers
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-            "Origin": self.base_url,
-            "Referer": f"{self.base_url}/signin/two-factor",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-        }
-        if self._csrf_token:
-            headers["X-CSRF-Token"] = self._csrf_token
 
         tfa_validated = False
 
-        # ── APPROACH A: Restore login cookies + PUT auth_code ──
-        logger.info("2FA Approach A: Restore cookies + PUT")
-        self._restore_login_cookies()
-        result_a = self._try_2fa_request(
-            "PUT", url, {"auth_code": code}, headers, "A_restore_cookies_PUT",
-        )
-        all_attempts.append(result_a)
-        if result_a.get("validated"):
-            tfa_validated = True
-
-        # ── APPROACH B: Include two_factor_auth_response in payload ──
-        if not tfa_validated and self._two_factor_auth_data:
-            logger.info("2FA Approach B: PUT with 2FA response data")
+        # ── APPROACH E: PUT with Authorization: Bearer refresh_token ──
+        if self._auth_token and not tfa_validated:
+            logger.info("2FA Approach E: PUT with Bearer token")
             self._restore_login_cookies()
+            bearer_headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._auth_token}",
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": self.base_url,
+                "Referer": f"{self.base_url}/signin/two-factor",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+            }
+            if self._csrf_token:
+                bearer_headers["X-CSRF-Token"] = self._csrf_token
 
-            payload_b = {"auth_code": code}
-            tfa_resp = self._two_factor_auth_data.get("two_factor_auth_response")
-            if isinstance(tfa_resp, dict):
-                payload_b.update(tfa_resp)
-
-            result_b = self._try_2fa_request(
-                "PUT", url, payload_b, headers, "B_with_tfa_response",
+            result_e = self._try_2fa_request(
+                "PUT", self._url(endpoint), {"auth_code": code},
+                bearer_headers, "E_bearer_token",
             )
-            all_attempts.append(result_b)
-            if result_b.get("validated"):
+            all_attempts.append(result_e)
+            if result_e.get("validated"):
                 tfa_validated = True
 
-        # ── APPROACH C: Re-login with auth_code in credentials ──
+        # ── APPROACH F: PUT on www.doctolib.fr ──
         if not tfa_validated:
-            logger.info("2FA Approach C: Combined login + auth_code")
+            logger.info("2FA Approach F: PUT on www.doctolib.fr")
+            www_url = f"https://www.doctolib.fr{endpoint}"
+            www_headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": "https://www.doctolib.fr",
+                "Referer": "https://www.doctolib.fr/signin/two-factor",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+            }
+            if self._csrf_token:
+                www_headers["X-CSRF-Token"] = self._csrf_token
+            if self._auth_token:
+                www_headers["Authorization"] = f"Bearer {self._auth_token}"
+
+            result_f = self._try_2fa_request(
+                "PUT", www_url, {"auth_code": code},
+                www_headers, "F_www_doctolib",
+            )
+            all_attempts.append(result_f)
+            if result_f.get("validated"):
+                tfa_validated = True
+
+        # ── APPROACH G: PUT on admin.doctolib.fr (redirect target) ──
+        if not tfa_validated:
+            logger.info("2FA Approach G: PUT on admin.doctolib.fr")
+            # Copy pro.doctolib.fr cookies to admin.doctolib.fr
+            for ci in self._login_cookies_snapshot:
+                if "pro.doctolib" in ci["domain"]:
+                    self.session.cookies.set(
+                        name=ci["name"], value=ci["value"],
+                        domain="admin.doctolib.fr", path=ci["path"],
+                    )
+            admin_url = f"https://admin.doctolib.fr{endpoint}"
+            admin_headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": "https://admin.doctolib.fr",
+                "Referer": "https://admin.doctolib.fr/",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+            }
+            if self._csrf_token:
+                admin_headers["X-CSRF-Token"] = self._csrf_token
+            if self._auth_token:
+                admin_headers["Authorization"] = f"Bearer {self._auth_token}"
+
+            result_g = self._try_2fa_request(
+                "PUT", admin_url, {"auth_code": code},
+                admin_headers, "G_admin_doctolib",
+            )
+            all_attempts.append(result_g)
+            if result_g.get("validated"):
+                tfa_validated = True
+
+        # ── APPROACH C: POST /login.json with auth_code + otp field variants ──
+        if not tfa_validated:
+            logger.info("2FA Approach C: Re-login with 2FA code in payload")
             self._restore_login_cookies()
 
-            login_with_code = {
-                "kind": "doctor",
-                "username": self.email,
-                "password": self.password,
-                "remember": True,
-                "remember_username": True,
-                "auth_code": code,
-            }
-            result_c = {"approach": "C_relogin_with_code"}
-            try:
-                resp = self.session.post(
-                    self._url("/login.json"), json=login_with_code,
-                    headers={
-                        "Accept": "application/json",
-                        "Content-Type": "application/json",
-                        "Origin": self.base_url,
-                        "Referer": f"{self.base_url}/sessions/new",
-                    },
-                )
-                result_c["status"] = resp.status_code
+            # Try multiple field names for the 2FA code in login payload
+            for code_field in ("auth_code", "otp", "two_factor_code"):
+                login_with_code = {
+                    "kind": "doctor",
+                    "username": self.email,
+                    "password": self.password,
+                    "remember": True,
+                    "remember_username": True,
+                    code_field: code,
+                }
+                result_c = {"approach": f"C_relogin_{code_field}"}
                 try:
-                    data = resp.json()
-                    result_c["data_keys"] = list(data.keys())[:20]
-                    redirect = data.get("redirect") or data.get("redirection")
-                    if resp.status_code == 200 and not (
-                        redirect and "two-factor" in str(redirect)
-                    ):
-                        tfa_validated = True
-                        result_c["validated"] = True
-                        self._account_data = data
-                        self._extract_token(data)
-                    else:
-                        result_c["validated"] = False
-                        result_c["still_needs_2fa"] = bool(
+                    resp = self.session.post(
+                        self._url("/login.json"), json=login_with_code,
+                        headers={
+                            "Accept": "application/json",
+                            "Content-Type": "application/json",
+                            "Origin": self.base_url,
+                            "Referer": f"{self.base_url}/sessions/new",
+                        },
+                    )
+                    result_c["status"] = resp.status_code
+                    try:
+                        data = resp.json()
+                        result_c["data_keys"] = list(data.keys())[:20]
+                        redirect = data.get("redirect") or data.get("redirection")
+                        if resp.status_code == 200 and not (
                             redirect and "two-factor" in str(redirect)
-                        )
-                except ValueError:
-                    result_c["body_preview"] = resp.text[:300]
-            except Exception as e:
-                result_c["error"] = str(e)
-            all_attempts.append(result_c)
+                        ):
+                            tfa_validated = True
+                            result_c["validated"] = True
+                            self._account_data = data
+                            self._extract_token(data)
+                        else:
+                            result_c["validated"] = False
+                            result_c["still_needs_2fa"] = bool(
+                                redirect and "two-factor" in str(redirect)
+                            )
+                    except ValueError:
+                        result_c["body_preview"] = resp.text[:300]
+                except Exception as e:
+                    result_c["error"] = str(e)
+                all_attempts.append(result_c)
+                if tfa_validated:
+                    break
 
-        # ── APPROACH D: Fresh login → immediate PUT (no intermediate requests) ──
+        # ── APPROACH D: Fresh login → immediate PUT with Bearer ──
         if not tfa_validated:
-            logger.info("2FA Approach D: Fresh login + immediate PUT")
-            result_d = {"approach": "D_fresh_login_immediate_PUT"}
+            logger.info("2FA Approach D: Fresh session + Bearer PUT")
+            result_d = {"approach": "D_fresh_bearer_PUT"}
             try:
-                # Fresh CSRF
                 resp = self.session.get(self._url("/sessions/new"))
                 if resp.status_code == 200:
                     self._extract_csrf_token(resp.text)
 
-                # Re-login
                 resp = self.session.post(
                     self._url("/login.json"),
                     json={
@@ -567,24 +615,33 @@ class DoctolibClient:
 
                 if resp.status_code == 200:
                     data = resp.json()
+                    self._extract_token(data)
                     redirect = data.get("redirect") or data.get("redirection")
                     if redirect and "two-factor" in str(redirect):
-                        # Back in 2FA state — immediate PUT with zero intermediate requests
-                        fresh_headers = dict(headers)
+                        fresh_headers = {
+                            "Accept": "application/json",
+                            "Content-Type": "application/json",
+                            "X-Requested-With": "XMLHttpRequest",
+                            "Origin": self.base_url,
+                            "Referer": f"{self.base_url}/signin/two-factor",
+                            "sec-fetch-dest": "empty",
+                            "sec-fetch-mode": "cors",
+                            "sec-fetch-site": "same-origin",
+                        }
                         if self._csrf_token:
                             fresh_headers["X-CSRF-Token"] = self._csrf_token
+                        if self._auth_token:
+                            fresh_headers["Authorization"] = f"Bearer {self._auth_token}"
                         put_result = self._try_2fa_request(
-                            "PUT", url, {"auth_code": code},
-                            fresh_headers, "D_immediate_PUT",
+                            "PUT", self._url(endpoint), {"auth_code": code},
+                            fresh_headers, "D_bearer_PUT",
                         )
                         all_attempts.append(put_result)
                         if put_result.get("validated"):
                             tfa_validated = True
-                    elif resp.status_code == 200:
-                        # Login succeeded without 2FA — already validated
+                    else:
                         tfa_validated = True
                         self._account_data = data
-                        self._extract_token(data)
                         result_d["validated"] = True
             except Exception as e:
                 result_d["error"] = str(e)
@@ -607,7 +664,6 @@ class DoctolibClient:
         self._authenticated = True
         self._requires_2fa = False
 
-        # If we don't have full account data, do a final re-login
         if not any(k in self._account_data for k in ("doctor", "agendas", "id")):
             try:
                 resp = self.session.post(
