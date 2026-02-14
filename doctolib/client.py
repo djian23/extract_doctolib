@@ -32,6 +32,8 @@ class DoctolibClient:
         self._csrf_token: Optional[str] = None
         self._admin_base_url: Optional[str] = None
         self._session_debug: dict[str, Any] = {}
+        self._login_cookies_snapshot: list = []
+        self._two_factor_auth_data: dict[str, Any] = {}
 
         self.session = CurlSession(impersonate="chrome")
         self.session.headers.update(self.BROWSER_HEADERS)
@@ -149,30 +151,38 @@ class DoctolibClient:
         logger.info(f"Login response keys: {list(data.keys())}")
         self._extract_token(data)
 
+        # Save 2FA data from login response (may be needed for PUT payload)
+        self._two_factor_auth_data = {}
+        for key in ("two_factor_auth_response", "two_factor_auth_methods",
+                     "two_factor_authentication", "otp_challenge"):
+            if key in data:
+                self._two_factor_auth_data[key] = data[key]
+                logger.info(f"Saved 2FA data key '{key}': {type(data[key])}")
+
+        # Snapshot ALL cookies right after login (before anything overwrites them)
+        self._login_cookies_snapshot = []
+        for cookie in self.session.cookies.jar:
+            self._login_cookies_snapshot.append({
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain,
+                "path": cookie.path,
+                "secure": cookie.secure,
+            })
+        logger.info(f"Saved {len(self._login_cookies_snapshot)} cookies after login")
+
         # Step 3: Check if 2FA is required
         redirect = data.get("redirect") or data.get("redirection")
         if redirect and "two-factor" in str(redirect):
             self._requires_2fa = True
 
-            # Step 3a: Visit the 2FA page to establish session state
-            # (the browser does this naturally; the server may require it)
-            try:
-                tfa_page = self.session.get(
-                    self._url("/signin/two-factor"),
-                    headers={"Referer": f"{self.base_url}/sessions/new"},
-                )
-                logger.info(f"2FA page visit: HTTP {tfa_page.status_code}")
-                if tfa_page.status_code == 200:
-                    self._extract_csrf_token(tfa_page.text)
-            except Exception as e:
-                logger.warning(f"Could not visit 2FA page: {e}")
-
-            # Step 3b: Send auth code via email
+            # Send auth code via email, then restore login cookies
             try:
                 send_headers = {
                     "Accept": "application/json",
                     "Content-Type": "application/json",
                     "X-Requested-With": "XMLHttpRequest",
+                    "Origin": self.base_url,
                     "Referer": f"{self.base_url}/signin/two-factor",
                 }
                 if self._csrf_token:
@@ -182,12 +192,19 @@ class DoctolibClient:
                     json={"two_factor_auth_method": "email"},
                     headers=send_headers,
                 )
+                # CRITICAL: restore login cookies (send_auth_code may have overwritten them)
+                self._restore_login_cookies()
             except Exception:
                 pass
             return {
                 "success": False,
                 "requires_2fa": True,
                 "message": "Code 2FA envoyé par email. Soumettez-le via POST /auth/2fa.",
+                "debug": {
+                    "two_factor_auth_data": self._two_factor_auth_data,
+                    "login_response_keys": list(data.keys())[:30],
+                    "redirect": redirect,
+                },
             }
 
         # No 2FA needed - login complete
@@ -224,6 +241,77 @@ class DoctolibClient:
             }
         except Exception as e:
             return {"message": f"Erreur: {e}", "status": 500}
+
+    def _restore_login_cookies(self) -> None:
+        """Restore session cookies saved right after POST /login.json.
+
+        Intermediate requests (send_auth_code, page visits) overwrite
+        the _doctolib_session cookie via Set-Cookie headers. This restores
+        the exact cookie state from when the login credentials were validated.
+        """
+        if not self._login_cookies_snapshot:
+            logger.warning("No login cookies snapshot to restore")
+            return
+        restored = 0
+        for ci in self._login_cookies_snapshot:
+            if ci["name"] == "_doctolib_session":
+                self.session.cookies.set(
+                    name=ci["name"], value=ci["value"],
+                    domain=ci["domain"], path=ci["path"],
+                )
+                restored += 1
+        logger.info(f"Restored {restored} _doctolib_session cookies")
+
+    def _try_2fa_request(
+        self, method: str, url: str, payload: dict,
+        headers: dict, label: str,
+    ) -> dict[str, Any]:
+        """Execute a single 2FA validation request and return structured result."""
+        result: dict[str, Any] = {
+            "approach": label, "method": method,
+            "payload_keys": list(payload.keys()),
+        }
+        try:
+            if method == "PUT":
+                resp = self.session.put(
+                    url, json=payload, headers=headers, allow_redirects=False,
+                )
+            else:
+                resp = self.session.post(
+                    url, json=payload, headers=headers, allow_redirects=False,
+                )
+
+            result["status"] = resp.status_code
+            result["location"] = resp.headers.get("Location")
+            result["set_cookie_headers"] = [
+                v for k, v in resp.headers.items() if k.lower() == "set-cookie"
+            ][:3]
+
+            resp_data = None
+            try:
+                resp_data = resp.json()
+                result["data"] = resp_data
+            except ValueError:
+                result["body_preview"] = resp.text[:300] if resp.text else ""
+
+            if resp.status_code in (200, 204):
+                if isinstance(resp_data, dict):
+                    redir = resp_data.get("redirect") or resp_data.get("redirection")
+                    if redir and "two-factor" in str(redir):
+                        result["validated"] = False
+                        return result
+                    self._extract_token(resp_data)
+                    if any(k in resp_data for k in ("doctor", "agendas", "id")):
+                        self._account_data = resp_data
+                result["validated"] = True
+            else:
+                result["validated"] = False
+
+            logger.info(f"2FA {label}: HTTP {resp.status_code}, validated={result['validated']}")
+        except Exception as e:
+            result["error"] = str(e)
+            result["validated"] = False
+        return result
 
     def _extract_token(self, data: dict) -> None:
         """Extract auth/refresh token from response data."""
@@ -337,34 +425,34 @@ class DoctolibClient:
         return data
 
     def submit_2fa_code(self, code: str) -> dict[str, Any]:
-        """Submit 2FA authentication code.
+        """Submit 2FA code using cascading fallback strategies.
 
-        Flow:
-        1. PUT /api/accounts/two_factor_authentication on multiple domains
-        2. Re-POST /login.json to complete authentication
+        A. Restore login cookies + PUT auth_code
+        B. PUT with two_factor_auth_response from login
+        C. POST /login.json with credentials + auth_code
+        D. Fresh login → immediate PUT (zero intermediate requests)
         """
         all_attempts = []
+        endpoint = "/api/accounts/two_factor_authentication"
+        url = self._url(endpoint)
 
-        # Debug: log current session cookies before attempting 2FA
+        # Debug: initial state
         session_cookies = []
         for cookie in self.session.cookies.jar:
             session_cookies.append({
                 "name": cookie.name,
                 "domain": cookie.domain,
                 "path": cookie.path,
-                "secure": cookie.secure,
             })
         all_attempts.append({
-            "step": "session_state",
+            "step": "initial_state",
             "cookies": session_cookies,
             "csrf_token": bool(self._csrf_token),
+            "login_cookies_saved": len(self._login_cookies_snapshot),
+            "two_factor_auth_data_keys": list(self._two_factor_auth_data.keys()),
         })
 
-        # Step 1: PUT to validate 2FA code on base domain
-        endpoint = "/api/accounts/two_factor_authentication"
-        tfa_validated = False
-        url = self._url(endpoint)
-
+        # Common headers
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -378,125 +466,178 @@ class DoctolibClient:
         if self._csrf_token:
             headers["X-CSRF-Token"] = self._csrf_token
 
-        payload = {"auth_code": code}
+        tfa_validated = False
 
-        for method in ("PUT", "POST"):
+        # ── APPROACH A: Restore login cookies + PUT auth_code ──
+        logger.info("2FA Approach A: Restore cookies + PUT")
+        self._restore_login_cookies()
+        result_a = self._try_2fa_request(
+            "PUT", url, {"auth_code": code}, headers, "A_restore_cookies_PUT",
+        )
+        all_attempts.append(result_a)
+        if result_a.get("validated"):
+            tfa_validated = True
+
+        # ── APPROACH B: Include two_factor_auth_response in payload ──
+        if not tfa_validated and self._two_factor_auth_data:
+            logger.info("2FA Approach B: PUT with 2FA response data")
+            self._restore_login_cookies()
+
+            payload_b = {"auth_code": code}
+            tfa_resp = self._two_factor_auth_data.get("two_factor_auth_response")
+            if isinstance(tfa_resp, dict):
+                payload_b.update(tfa_resp)
+
+            result_b = self._try_2fa_request(
+                "PUT", url, payload_b, headers, "B_with_tfa_response",
+            )
+            all_attempts.append(result_b)
+            if result_b.get("validated"):
+                tfa_validated = True
+
+        # ── APPROACH C: Re-login with auth_code in credentials ──
+        if not tfa_validated:
+            logger.info("2FA Approach C: Combined login + auth_code")
+            self._restore_login_cookies()
+
+            login_with_code = {
+                "kind": "doctor",
+                "username": self.email,
+                "password": self.password,
+                "remember": True,
+                "remember_username": True,
+                "auth_code": code,
+            }
+            result_c = {"approach": "C_relogin_with_code"}
             try:
-                if method == "PUT":
-                    resp = self.session.put(
-                        url, json=payload,
-                        headers=headers, allow_redirects=False,
-                    )
-                else:
-                    resp = self.session.post(
-                        url, json=payload,
-                        headers=headers, allow_redirects=False,
-                    )
-                logger.info(f"2FA {method} [{url}]: HTTP {resp.status_code}")
-
-                resp_data = None
+                resp = self.session.post(
+                    self._url("/login.json"), json=login_with_code,
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "Origin": self.base_url,
+                        "Referer": f"{self.base_url}/sessions/new",
+                    },
+                )
+                result_c["status"] = resp.status_code
                 try:
-                    resp_data = resp.json()
+                    data = resp.json()
+                    result_c["data_keys"] = list(data.keys())[:20]
+                    redirect = data.get("redirect") or data.get("redirection")
+                    if resp.status_code == 200 and not (
+                        redirect and "two-factor" in str(redirect)
+                    ):
+                        tfa_validated = True
+                        result_c["validated"] = True
+                        self._account_data = data
+                        self._extract_token(data)
+                    else:
+                        result_c["validated"] = False
+                        result_c["still_needs_2fa"] = bool(
+                            redirect and "two-factor" in str(redirect)
+                        )
                 except ValueError:
-                    pass
-
-                attempt_info = {
-                    "method": method,
-                    "url": url,
-                    "status": resp.status_code,
-                    "data": resp_data,
-                    "body_preview": resp.text[:300] if resp_data is None and resp.text else None,
-                    "location": resp.headers.get("Location"),
-                    "set_cookie_headers": [
-                        v for k, v in resp.headers.items() if k.lower() == "set-cookie"
-                    ][:3],
-                }
-                all_attempts.append(attempt_info)
-
-                # 2xx = code validated
-                if resp.status_code in (200, 204):
-                    tfa_validated = True
-
-                    if isinstance(resp_data, dict):
-                        redir = resp_data.get("redirect") or resp_data.get("redirection")
-                        if redir and "two-factor" in str(redir):
-                            tfa_validated = False
-                            continue
-                        self._extract_token(resp_data)
-                        if any(k in resp_data for k in ("doctor", "agendas", "id")):
-                            self._account_data = resp_data
-                    break
-
-                # 302 to signin = session lost
-                if resp.status_code == 302:
-                    location = resp.headers.get("Location", "")
-                    if "signin" in location:
-                        continue
-
+                    result_c["body_preview"] = resp.text[:300]
             except Exception as e:
-                all_attempts.append({"method": method, "url": url, "error": str(e)})
-                continue
+                result_c["error"] = str(e)
+            all_attempts.append(result_c)
 
+        # ── APPROACH D: Fresh login → immediate PUT (no intermediate requests) ──
+        if not tfa_validated:
+            logger.info("2FA Approach D: Fresh login + immediate PUT")
+            result_d = {"approach": "D_fresh_login_immediate_PUT"}
+            try:
+                # Fresh CSRF
+                resp = self.session.get(self._url("/sessions/new"))
+                if resp.status_code == 200:
+                    self._extract_csrf_token(resp.text)
+
+                # Re-login
+                resp = self.session.post(
+                    self._url("/login.json"),
+                    json={
+                        "kind": "doctor",
+                        "username": self.email,
+                        "password": self.password,
+                        "remember": True,
+                        "remember_username": True,
+                    },
+                )
+                result_d["relogin_status"] = resp.status_code
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    redirect = data.get("redirect") or data.get("redirection")
+                    if redirect and "two-factor" in str(redirect):
+                        # Back in 2FA state — immediate PUT with zero intermediate requests
+                        fresh_headers = dict(headers)
+                        if self._csrf_token:
+                            fresh_headers["X-CSRF-Token"] = self._csrf_token
+                        put_result = self._try_2fa_request(
+                            "PUT", url, {"auth_code": code},
+                            fresh_headers, "D_immediate_PUT",
+                        )
+                        all_attempts.append(put_result)
+                        if put_result.get("validated"):
+                            tfa_validated = True
+                    elif resp.status_code == 200:
+                        # Login succeeded without 2FA — already validated
+                        tfa_validated = True
+                        self._account_data = data
+                        self._extract_token(data)
+                        result_d["validated"] = True
+            except Exception as e:
+                result_d["error"] = str(e)
+            all_attempts.append(result_d)
+
+        # ── All failed: return comprehensive debug ──
         if not tfa_validated:
             return {
                 "success": False,
                 "requires_2fa": True,
-                "message": "Code 2FA invalide ou session expirée. Essayez POST /auth/login pour recommencer.",
-                "debug": all_attempts,
-            }
-
-        # Step 3: Re-login now that 2FA is validated
-        relogin_info = {}
-        login_payload = {
-            "kind": "doctor",
-            "username": self.email,
-            "password": self.password,
-            "remember": True,
-            "remember_username": True,
-        }
-        try:
-            resp = self.session.post(self._url("/login.json"), json=login_payload)
-            relogin_info = {
-                "status": resp.status_code,
-                "body_preview": resp.text[:500] if resp.text else "",
-            }
-            try:
-                data = resp.json()
-                relogin_info["data_keys"] = list(data.keys())[:20]
-
-                redir = data.get("redirect") or data.get("redirection")
-                if redir and "two-factor" in str(redir):
-                    relogin_info["still_needs_2fa"] = True
-                else:
-                    relogin_info["still_needs_2fa"] = False
-                    self._account_data = data
-                    self._extract_token(data)
-                    self._authenticated = True
-                    self._requires_2fa = False
-            except ValueError:
-                relogin_info["json_parse_error"] = True
-        except Exception as e:
-            relogin_info["error"] = str(e)
-
-        all_attempts.append({"step": "re-login", **relogin_info})
-
-        if self._authenticated:
-            session_debug = self._complete_session()
-            return {
-                "success": True,
-                "requires_2fa": False,
-                "message": "2FA validée et session authentifiée.",
+                "message": "Toutes les stratégies 2FA ont échoué. Voir debug.",
                 "debug": {
                     "attempts": all_attempts,
-                    "session_setup": session_debug,
+                    "two_factor_auth_data": self._two_factor_auth_data,
+                    "login_response_keys": list(self._account_data.keys())[:30],
                 },
             }
 
+        # ── Success: complete the session ──
+        self._authenticated = True
+        self._requires_2fa = False
+
+        # If we don't have full account data, do a final re-login
+        if not any(k in self._account_data for k in ("doctor", "agendas", "id")):
+            try:
+                resp = self.session.post(
+                    self._url("/login.json"),
+                    json={
+                        "kind": "doctor",
+                        "username": self.email,
+                        "password": self.password,
+                        "remember": True,
+                        "remember_username": True,
+                    },
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    redirect = data.get("redirect") or data.get("redirection")
+                    if not (redirect and "two-factor" in str(redirect)):
+                        self._account_data = data
+                        self._extract_token(data)
+            except Exception:
+                pass
+
+        session_debug = self._complete_session()
         return {
-            "success": False,
-            "requires_2fa": True,
-            "message": "2FA validée mais session non authentifiée. Re-login échoué.",
-            "debug": all_attempts,
+            "success": True,
+            "requires_2fa": False,
+            "message": "2FA validée et session authentifiée.",
+            "debug": {
+                "attempts": all_attempts,
+                "session_setup": session_debug,
+            },
         }
 
     def _complete_session(self) -> dict[str, Any]:
@@ -664,6 +805,8 @@ class DoctolibClient:
         self._csrf_token = None
         self._admin_base_url = None
         self._session_debug = {}
+        self._login_cookies_snapshot = []
+        self._two_factor_auth_data = {}
         self.session = CurlSession(impersonate="chrome")
         self.session.headers.update(self.BROWSER_HEADERS)
 
