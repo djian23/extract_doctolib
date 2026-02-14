@@ -46,6 +46,19 @@ def submit_2fa(body: TwoFactorRequest, request: Request):
     return JSONResponse(content=result, status_code=status_code)
 
 
+@router.post("/resend-code")
+def resend_2fa_code(request: Request):
+    """Renvoyer le code 2FA par email."""
+    client = request.app.state.doctolib_client
+    if not client.requires_2fa:
+        return JSONResponse(
+            content={"message": "Aucune 2FA en attente. Connectez-vous d'abord."},
+            status_code=400,
+        )
+    result = client.resend_2fa_code()
+    return result
+
+
 @router.get("/status", response_model=AuthStatus)
 def auth_status(request: Request):
     """Vérifier l'état de l'authentification."""

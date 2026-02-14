@@ -182,6 +182,21 @@ class DoctolibClient:
             "debug": {"session_setup": session_debug},
         }
 
+    def resend_2fa_code(self) -> dict[str, Any]:
+        """Resend the 2FA code via email."""
+        try:
+            resp = self.session.post(
+                self._url("/api/accounts/send_auth_code"),
+                json={"two_factor_auth_method": "email"},
+            )
+            return {
+                "message": "Code 2FA renvoyé par email.",
+                "status": resp.status_code,
+                "response": resp.text[:200] if resp.text else "",
+            }
+        except Exception as e:
+            return {"message": f"Erreur: {e}", "status": 500}
+
     def _extract_token(self, data: dict) -> None:
         """Extract auth/refresh token from response data."""
         for key in ("refresh_token", "token", "access_token", "auth_token"):
