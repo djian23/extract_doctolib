@@ -171,6 +171,16 @@ class DoctolibClient:
                 last_resp = resp
                 logger.info(f"2FA attempt on {endpoint}: HTTP {resp.status_code}")
                 if resp.status_code < 400:
+                    # Try to capture response data
+                    try:
+                        resp_data = resp.json()
+                        if resp_data and isinstance(resp_data, dict):
+                            # If the 2FA response contains account data, store it
+                            if "doctor" in resp_data or "agendas" in resp_data:
+                                self._account_data = resp_data
+                                logger.info("Account data updated from 2FA response")
+                    except ValueError:
+                        pass
                     break
             except Exception as e:
                 logger.warning(f"2FA attempt on {endpoint} failed: {e}")
@@ -192,11 +202,40 @@ class DoctolibClient:
 
         self._authenticated = True
         self._requires_2fa = False
+
+        # Re-fetch full account data after successful 2FA
+        self._refresh_account_data()
+
         return {
             "success": True,
             "requires_2fa": False,
             "message": "Authentification 2FA réussie.",
         }
+
+    def _refresh_account_data(self) -> None:
+        """Fetch full account data after authentication (post-2FA)."""
+        account_endpoints = [
+            "/api/accounts/current.json",
+            "/account.json",
+            "/api/account.json",
+        ]
+        for path in account_endpoints:
+            try:
+                resp = self.session.get(self._url(path))
+                logger.info(f"Account refresh {path}: HTTP {resp.status_code}")
+                if resp.status_code < 400:
+                    data = resp.json()
+                    if data and isinstance(data, dict):
+                        self._account_data = data
+                        logger.info(
+                            f"Account data refreshed from {path}, "
+                            f"keys: {list(data.keys())[:10]}"
+                        )
+                        return
+            except Exception as e:
+                logger.warning(f"Account refresh {path} failed: {e}")
+                continue
+        logger.warning("Could not refresh account data from any endpoint")
 
     def logout(self) -> None:
         """Reset session."""
@@ -207,12 +246,35 @@ class DoctolibClient:
         self.session.headers.update(self.DEFAULT_HEADERS)
 
     def _get_agenda_ids(self) -> str:
-        """Extract agenda IDs from account data."""
+        """Extract agenda IDs from account data, searching multiple structures."""
         agendas = []
+
+        # Try "doctor.agendas" (login response structure)
         doctor = self._account_data.get("doctor", {})
         for agenda in doctor.get("agendas", []):
-            agendas.append(str(agenda.get("id", "")))
-        return "-".join(agendas) if agendas else ""
+            aid = agenda.get("id")
+            if aid:
+                agendas.append(str(aid))
+
+        # Try top-level "agendas" (account endpoint structure)
+        if not agendas:
+            for agenda in self._account_data.get("agendas", []):
+                aid = agenda.get("id")
+                if aid:
+                    agendas.append(str(aid))
+
+        # Try "data.agendas" variant
+        if not agendas:
+            data = self._account_data.get("data", {})
+            if isinstance(data, dict):
+                for agenda in data.get("agendas", []):
+                    aid = agenda.get("id")
+                    if aid:
+                        agendas.append(str(aid))
+
+        result = "-".join(agendas)
+        logger.info(f"Agenda IDs extracted: '{result}' (from keys: {list(self._account_data.keys())[:10]})")
+        return result
 
     # --- Appointments ---
 
@@ -236,40 +298,56 @@ class DoctolibClient:
             end_date = (date.today() + timedelta(days=30)).isoformat()
 
         agenda_ids = self._get_agenda_ids()
+        base_params = {"start_date": start_date, "end_date": end_date}
+        params_with_agendas = {**base_params, **({"agenda_ids": agenda_ids} if agenda_ids else {})}
 
         # Try multiple known Doctolib Pro endpoints
         endpoints = [
-            ("/api/events.json", {
-                "start_date": start_date,
-                "end_date": end_date,
-                **({"agenda_ids": agenda_ids} if agenda_ids else {}),
-            }),
-            ("/events.json", {
-                "start_date": start_date,
-                "end_date": end_date,
-                **({"agenda_ids": agenda_ids} if agenda_ids else {}),
-            }),
-            ("/calendar/events.json", {
-                "start_date": start_date,
-                "end_date": end_date,
-            }),
-            ("/appointments.json", {
-                "start_date": start_date,
-                "end_date": end_date,
-            }),
+            ("/api/events.json", params_with_agendas),
+            ("/events.json", params_with_agendas),
+            ("/api/calendar/events.json", params_with_agendas),
+            ("/calendar/events.json", base_params),
+            ("/appointments.json", base_params),
+            ("/api/appointments.json", base_params),
         ]
 
+        # If we have individual agenda IDs, also try per-agenda endpoints
+        if agenda_ids:
+            for aid in agenda_ids.split("-"):
+                endpoints.append((f"/api/agendas/{aid}/events.json", base_params))
+
+        errors = []
         for path, params in endpoints:
             try:
                 resp = self.session.get(self._url(path), params=params)
-                logger.info(f"Appointments attempt {path}: HTTP {resp.status_code}")
-                if resp.status_code < 400:
-                    return resp.json()
+                status = resp.status_code
+                # Log response snippet for debugging
+                body_preview = resp.text[:200] if resp.text else "(empty)"
+                logger.info(
+                    f"Appointments {path}: HTTP {status} | "
+                    f"Body: {body_preview}"
+                )
+                if status < 400:
+                    try:
+                        data = resp.json()
+                        # Validate it looks like real data (not a login page)
+                        if isinstance(data, (list, dict)):
+                            return data
+                    except ValueError:
+                        errors.append(f"{path}: HTTP {status} but invalid JSON")
+                        continue
+                else:
+                    errors.append(f"{path}: HTTP {status}")
             except Exception as e:
+                errors.append(f"{path}: {e}")
                 logger.warning(f"Appointments attempt {path} failed: {e}")
                 continue
 
-        raise RuntimeError(f"Aucun endpoint n'a fonctionné pour les rendez-vous.")
+        error_details = "; ".join(errors)
+        raise RuntimeError(
+            f"Aucun endpoint n'a fonctionné pour les rendez-vous. "
+            f"Agenda IDs: '{agenda_ids}'. Détails: {error_details}"
+        )
 
     def get_appointment(self, appointment_id: int) -> dict[str, Any]:
         """Fetch details of a specific appointment."""
